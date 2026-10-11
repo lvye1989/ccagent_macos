@@ -19,7 +19,10 @@ const SEARCH_ENGINES: Readonly<Record<BrowserSearchEngine, { base: string; param
   duckduckgo: { base: "https://duckduckgo.com/", parameter: "q" },
 });
 
-const BROWSER_PROCESS_NAMES = new Set(["brave", "chrome", "firefox", "msedge", "opera", "vivaldi"]);
+const BROWSER_PROCESS_NAMES = new Set([
+  "arc", "brave", "brave browser", "chrome", "firefox", "google chrome", "microsoft edge",
+  "msedge", "opera", "safari", "vivaldi",
+]);
 const MAX_QUERY_CHARS = 500;
 const MAX_URL_CHARS = 2_048;
 const GRANT_TTL_MS = 30_000;
@@ -417,7 +420,7 @@ async function openExternalUrl(url: string, signal?: AbortSignal): Promise<boole
 
 const DEFAULT_RUNTIME: BrowserSearchRuntime = {
   openExternalUrl,
-  listWindows: async (signal) => process.platform === "win32" ? listComputerWindows(signal) : [],
+  listWindows: async (signal) => ["win32", "darwin"].includes(process.platform) ? listComputerWindows(signal) : [],
   ensureIndicator: ensureComputerUseIndicatorSession,
   wait: waitWithAbort,
 };

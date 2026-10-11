@@ -541,14 +541,14 @@ function getRiskLabel(tool: Tool, input: Record<string, unknown>): string {
   if (tool.name === "ComputerAction" || tool.name === "ComputerActionGroup" || tool.name === "ComputerNavigate") {
     const category = typeof input.risk_category === "string" ? input.risk_category : "unknown";
     if (tool.name === "ComputerNavigate") {
-      return "Medium risk: bounded Jev-controlled Windows navigation";
+      return "Medium risk: bounded Jev-controlled desktop navigation";
     }
     if (tool.name === "ComputerActionGroup") {
       return "Medium risk: one Jev-approved ordinary browser action group";
     }
     return category === "ordinary"
-      ? "Medium risk: controls a Windows application"
-      : `High risk: Windows UI action category ${category} requires fresh confirmation`;
+      ? "Medium risk: controls a desktop application"
+      : `High risk: desktop UI action category ${category} requires fresh confirmation`;
   }
 
   if (tool.name === "RhinoAction") {

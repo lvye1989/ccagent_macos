@@ -56,6 +56,17 @@ function rhinoProgId(): string {
     : "Rhino.Interface.8";
 }
 
+async function resolveRhinoCodeExecutable(): Promise<string> {
+  const configured = process.env.CCAGENT_RHINOCODE?.trim();
+  if (configured) return configured;
+  const candidates = [
+    "/Applications/Rhino 8.app/Contents/Resources/bin/rhinocode",
+    "/Applications/Rhinoceros.app/Contents/Resources/bin/rhinocode",
+  ];
+  for (const candidate of candidates) if (await pathExists(candidate)) return candidate;
+  return "rhinocode";
+}
+
 async function pathExists(candidate: string): Promise<boolean> {
   try {
     await access(candidate);
@@ -226,6 +237,61 @@ async function runPowerShell(
   });
 }
 
+async function runRhinoCode(args: string[], signal?: AbortSignal): Promise<string> {
+  if (process.platform !== "darwin") {
+    throw new Error("The rhinocode bridge is available only on macOS.");
+  }
+  if (signal?.aborted) throw new Error("Rhino operation was aborted before it started.");
+  const executable = await resolveRhinoCodeExecutable();
+  const instance = process.env.CCAGENT_RHINO_INSTANCE?.trim();
+  const finalArgs = [...(instance ? ["--rhino", instance] : []), ...args];
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(executable, finalArgs, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve(stdout.trim());
+    };
+    const onAbort = () => {
+      child.kill();
+      finish(new Error("Rhino operation aborted. Observe the document again before retrying."));
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(new Error(`Rhino operation timed out after ${timeoutMs()}ms.`));
+    }, timeoutMs());
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      if (stdout.length < MAX_RESULT_BYTES) stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      if (stderr.length < 20_000) stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => finish(new Error(
+      `Unable to start rhinocode (${executable}): ${error.message}. Install Rhino 8.11 or newer, run StartScriptServer in Rhino, or set CCAGENT_RHINOCODE.`,
+    )));
+    child.once("close", (code) => {
+      if (code !== 0) {
+        const detail = (stderr.trim() || stdout.trim() || `rhinocode exited with code ${code}`).slice(0, 2_000);
+        finish(new Error(
+          `${detail} Open Rhino 8, run StartScriptServer once, keep only the intended document open, and retry. ` +
+            "If multiple Rhino instances are running, set CCAGENT_RHINO_INSTANCE to an id from `rhinocode list --json`.",
+        ));
+      } else finish();
+    });
+  });
+}
+
 async function serialized<T>(operation: () => Promise<T>): Promise<T> {
   const previous = rhinoCallTail;
   let release!: () => void;
@@ -265,14 +331,20 @@ async function executeJob(
       await writeFile(wrapperPath, wrapper, { encoding: "utf8", mode: 0o600 });
       await files.sealInputs();
       dispatchStarted = true;
-      await runPowerShell(
-        powerShellScript(),
-        {
-          CCAGENT_RHINO_PROGID_VALUE: rhinoProgId(),
-          CCAGENT_RHINO_WRAPPER: wrapperPath,
-        },
-        signal,
-      );
+      if (process.platform === "win32") {
+        await runPowerShell(
+          powerShellScript(),
+          {
+            CCAGENT_RHINO_PROGID_VALUE: rhinoProgId(),
+            CCAGENT_RHINO_WRAPPER: wrapperPath,
+          },
+          signal,
+        );
+      } else if (process.platform === "darwin") {
+        await runRhinoCode(["script", wrapperPath], signal);
+      } else {
+        throw new Error("The RhinoCommon automation bridge supports Rhino 8 on Windows and macOS only.");
+      }
       const raw = await readFile(resultPath);
       if (raw.byteLength > MAX_RESULT_BYTES) throw new Error("Rhino bridge result exceeded the 2 MB safety limit.");
       const parsed: unknown = JSON.parse(raw.toString("utf8"));
@@ -299,7 +371,7 @@ async function executeJob(
       }
       throw error;
     } finally {
-      // A killed COM caller does not prove Rhino stopped using these files.
+      // A killed COM/rhinocode caller does not prove Rhino stopped using these files.
       // Delete only known job files after completion; task finalization retries.
       await files.finish(!dispatchStarted || bridgeFinished).catch((error) => {
         logWarn(`Rhino temporary files retained: ${(error as Error).message}`);
@@ -426,11 +498,17 @@ export async function executeRhinoAction(
     };
     await writeFile(snapshotPath, JSON.stringify(snapshot, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
     await serialized(async () => {
-      await runPowerShell(
-        fixedUndoPowerShellScript(),
-        { CCAGENT_RHINO_PROGID_VALUE: rhinoProgId() },
-        signal,
-      );
+      if (process.platform === "win32") {
+        await runPowerShell(
+          fixedUndoPowerShellScript(),
+          { CCAGENT_RHINO_PROGID_VALUE: rhinoProgId() },
+          signal,
+        );
+      } else if (process.platform === "darwin") {
+        await runRhinoCode(["command", "_Undo"], signal);
+      } else {
+        throw new Error("Rhino Undo automation supports Windows and macOS only.");
+      }
     }).finally(() => observations.clear());
     return {
       ok: true,

@@ -1,6 +1,6 @@
 # Rhino / Grasshopper 常用工具手册
 
-适用范围：Windows + 正在运行的 Rhino 8；使用应用内置 `rhino_agent`。无需额外安装 MCP；这是 CCAGENT 自带的结构化 RhinoCommon / Grasshopper 工具层。
+适用范围：macOS + 正在运行的 Rhino 8.11 或更高版本；使用应用内置 `rhino_agent`。请先在 Rhino 中执行一次 `StartScriptServer`。无需额外安装 MCP；这是 CCAGENT 自带的结构化 RhinoCommon / Grasshopper 工具层。Windows COM 后端仍保留兼容。
 
 ## 调用原则
 

@@ -497,7 +497,7 @@ export const rhinoObserveTool: Tool = {
     }
   },
   isReadOnly: () => true,
-  isEnabled: () => process.platform === "win32",
+  isEnabled: () => process.platform === "win32" || process.platform === "darwin",
 };
 
 export const rhinoActionTool: Tool = {
@@ -590,7 +590,7 @@ export const rhinoActionTool: Tool = {
     }
   },
   isReadOnly: () => false,
-  isEnabled: () => process.platform === "win32",
+  isEnabled: () => process.platform === "win32" || process.platform === "darwin",
 };
 
 export const rhinoInspectTool: Tool = {
@@ -630,5 +630,5 @@ export const rhinoInspectTool: Tool = {
   },
   isReadOnly:()=>true,
   isConcurrencySafe:()=>false,
-  isEnabled:()=>process.platform==="win32",
+  isEnabled:()=>process.platform==="win32" || process.platform==="darwin",
 };

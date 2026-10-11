@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 export const COMPUTER_USE_INDICATOR_TITLE = "ccagent正在控制电脑";
-export const COMPUTER_USE_INDICATOR_SUBTITLE = "代理指针独立运行 · 您的鼠标仍可自由移动";
+export const COMPUTER_USE_INDICATOR_SUBTITLE = process.platform === "darwin"
+  ? "macOS 辅助功能控制已启用 · 输入仅发送到已验证窗口"
+  : "代理指针独立运行 · 您的鼠标仍可自由移动";
 
 export interface ComputerUseIndicatorConfig {
   enabled: boolean;
@@ -19,6 +21,7 @@ interface IndicatorSession {
 }
 
 const indicatorSessions = new Map<string, Promise<IndicatorSession>>();
+const macIndicatorSessions = new Set<string>();
 
 function envBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || !value.trim()) return fallback;
@@ -197,6 +200,24 @@ function normalizeSessionKey(sessionId: string | undefined): string {
   return sessionId?.trim() || "default";
 }
 
+async function showMacIndicator(targetLabel: string): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const child = spawn(
+      "/usr/bin/osascript",
+      [
+        "-e",
+        "on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)\nend run",
+        `目标：${targetLabel.slice(0, 80)}`,
+        COMPUTER_USE_INDICATOR_TITLE,
+        COMPUTER_USE_INDICATOR_SUBTITLE,
+      ],
+      { stdio: "ignore", windowsHide: true },
+    );
+    child.once("error", () => resolve());
+    child.once("exit", () => resolve());
+  });
+}
+
 async function createIndicatorSession(key: string, targetLabel: string): Promise<IndicatorSession> {
   const config = getComputerUseIndicatorConfig();
   const dir = await mkdtemp(path.join(os.tmpdir(), "ccagent-control-indicator-"));
@@ -252,8 +273,16 @@ export async function ensureComputerUseIndicatorSession(
   sessionId: string | undefined,
   targetLabel: string,
 ): Promise<string | undefined> {
-  if (process.platform !== "win32" || !getComputerUseIndicatorConfig().enabled) return undefined;
+  if (!getComputerUseIndicatorConfig().enabled) return undefined;
   const key = normalizeSessionKey(sessionId);
+  if (process.platform === "darwin") {
+    if (!macIndicatorSessions.has(key)) {
+      macIndicatorSessions.add(key);
+      await showMacIndicator(targetLabel);
+    }
+    return undefined;
+  }
+  if (process.platform !== "win32") return undefined;
   let pending = indicatorSessions.get(key);
   if (!pending) {
     pending = createIndicatorSession(key, targetLabel);
@@ -272,6 +301,7 @@ export async function ensureComputerUseIndicatorSession(
 /** End the indicator exactly when the owning agent turn ends or is aborted. */
 export async function endComputerUseIndicatorSession(sessionId?: string): Promise<void> {
   const key = normalizeSessionKey(sessionId);
+  macIndicatorSessions.delete(key);
   const pending = indicatorSessions.get(key);
   if (!pending) return;
   indicatorSessions.delete(key);

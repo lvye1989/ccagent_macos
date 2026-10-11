@@ -288,5 +288,5 @@ export const rhinoSequenceTool: Tool = {
   },
   isReadOnly: () => false,
   isConcurrencySafe: () => false,
-  isEnabled: () => process.platform === "win32" && process.env.CCAGENT_RHINO_FAST !== "0",
+  isEnabled: () => (process.platform === "win32" || process.platform === "darwin") && process.env.CCAGENT_RHINO_FAST !== "0",
 };

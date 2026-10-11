@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   ensureComputerUseIndicatorSession,
 } from "./computerUseIndicator.js";
@@ -54,6 +55,117 @@ export type ComputerAction =
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_CHARS = 2_000_000;
+let macHelperPromise: Promise<string> | undefined;
+
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await access(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runProcess(
+  executable: string,
+  args: string[],
+  env: NodeJS.ProcessEnv = {},
+  signal?: AbortSignal,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<string> {
+  if (signal?.aborted) throw new Error("Computer Use operation aborted before it started.");
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...env },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve(stdout.trim());
+    };
+    const onAbort = () => {
+      child.kill();
+      finish(new Error("Computer Use operation aborted. Re-observe before retrying."));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(new Error("Computer Use operation timed out. Its outcome is unknown; re-observe before retrying."));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      if (stdout.length < MAX_OUTPUT_CHARS) stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      if (stderr.length < MAX_OUTPUT_CHARS) stderr += chunk.toString();
+    });
+    child.once("error", (error) => finish(new Error(`Failed to start ${path.basename(executable)}: ${error.message}`)));
+    child.once("close", (code) => {
+      if ((code ?? 1) !== 0) {
+        finish(new Error((stderr.trim() || stdout.trim() || `${path.basename(executable)} exited with code ${code ?? -1}`).slice(0, 4_000)));
+      } else finish();
+    });
+  });
+}
+
+async function resolveMacHelperSourcePath(): Promise<string> {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(moduleDir, "../../macos/ccagent_computer_use.swift"),
+    path.resolve(moduleDir, "../macos/ccagent_computer_use.swift"),
+  ];
+  for (const candidate of candidates) if (await pathExists(candidate)) return candidate;
+  throw new Error(`CCAGENT macOS Computer Use helper source is missing. Checked: ${candidates.join(", ")}`);
+}
+
+async function resolveMacHelperPath(): Promise<string> {
+  if (process.platform !== "darwin") throw new Error("The macOS Computer Use helper is only available on macOS.");
+  if (!macHelperPromise) {
+    macHelperPromise = (async () => {
+      const sourcePath = await resolveMacHelperSourcePath();
+      const source = await readFile(sourcePath);
+      const digest = createHash("sha256").update(source).digest("hex").slice(0, 16);
+      const binDir = path.join(os.homedir(), ".ccagent", "bin");
+      const executablePath = path.join(binDir, `ccagent-computer-use-macos-${digest}`);
+      if (await pathExists(executablePath)) return executablePath;
+      await mkdir(binDir, { recursive: true, mode: 0o700 });
+      const temporaryPath = `${executablePath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+      try {
+        await runProcess("/usr/bin/xcrun", ["swiftc", sourcePath, "-O", "-o", temporaryPath], {}, undefined, 120_000);
+        await chmod(temporaryPath, 0o700);
+        try {
+          await rename(temporaryPath, executablePath);
+        } catch (error) {
+          if (!(await pathExists(executablePath))) throw error;
+        }
+        await chmod(executablePath, 0o700);
+      } finally {
+        await rm(temporaryPath, { force: true }).catch(() => {});
+      }
+      return executablePath;
+    })().catch((error) => {
+      macHelperPromise = undefined;
+      throw error;
+    });
+  }
+  return await macHelperPromise;
+}
+
+async function runMacHelper(
+  args: string[],
+  env: NodeJS.ProcessEnv = {},
+  signal?: AbortSignal,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<string> {
+  return await runProcess(await resolveMacHelperPath(), args, env, signal, timeoutMs);
+}
 
 function nativePreamble(): string {
   return [
@@ -266,6 +378,10 @@ const LIST_WINDOWS_SCRIPT = [
 ].join("\n");
 
 export async function listComputerWindows(signal?: AbortSignal): Promise<ComputerWindow[]> {
+  if (process.platform === "darwin") {
+    const parsed = parseJsonOutput<ComputerWindow[]>(await runMacHelper(["list"], {}, signal, 10_000));
+    return parsed.filter((item) => item && typeof item.id === "string" && item.title.trim().length > 0);
+  }
   const output = await runPowerShell(LIST_WINDOWS_SCRIPT, {}, signal, 10_000);
   const parsed = parseJsonOutput<ComputerWindow[] | ComputerWindow>(output);
   return (Array.isArray(parsed) ? parsed : [parsed]).filter(
@@ -368,6 +484,66 @@ export async function observeComputerWindow(
   const dir = await mkdtemp(path.join(os.tmpdir(), "ccagent-computer-use-"));
   const screenshotPath = path.join(dir, randomUUID() + ".jpg");
   try {
+    if (process.platform === "darwin") {
+      const state = parseJsonOutput<{
+        title?: string;
+        width: number;
+        height: number;
+        nativeWidth: number;
+        nativeHeight: number;
+        elements?: ComputerElement[];
+        focusedElement?: string | null;
+      }>(await runMacHelper(["observe", window.id], {}, signal));
+      try {
+        await runProcess(
+          "/usr/sbin/screencapture",
+          ["-x", "-o", "-l", window.id, "-t", "jpg", screenshotPath],
+          {},
+          signal,
+          15_000,
+        );
+      } catch (error) {
+        throw new Error(
+          "macOS Screen Recording permission is required. Open System Settings > Privacy & Security > Screen Recording, allow the terminal running CCAGENT, then retry. " +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      }
+      await runProcess("/usr/bin/sips", ["--resampleHeightWidthMax", "1600", screenshotPath], {}, signal, 15_000);
+      const imageInfo = await runProcess(
+        "/usr/bin/sips",
+        ["-g", "pixelWidth", "-g", "pixelHeight", screenshotPath],
+        {},
+        signal,
+        15_000,
+      );
+      const width = Number(/pixelWidth:\s*(\d+)/.exec(imageInfo)?.[1]);
+      const height = Number(/pixelHeight:\s*(\d+)/.exec(imageInfo)?.[1]);
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) {
+        throw new Error("Could not read the macOS window screenshot dimensions.");
+      }
+      const scaleX = width / state.nativeWidth;
+      const scaleY = height / state.nativeHeight;
+      const elements = (Array.isArray(state.elements) ? state.elements : []).map((element) => ({
+        ...element,
+        ...(element.x !== undefined ? { x: Math.round(element.x * scaleX) } : {}),
+        ...(element.y !== undefined ? { y: Math.round(element.y * scaleY) } : {}),
+        ...(element.width !== undefined ? { width: Math.round(element.width * scaleX) } : {}),
+        ...(element.height !== undefined ? { height: Math.round(element.height * scaleY) } : {}),
+      }));
+      const screenshot = await readFile(screenshotPath);
+      if (screenshot.length === 0) throw new Error("Computer Use captured an empty screenshot.");
+      return {
+        window: state.title?.trim() ? { ...window, title: state.title.trim() } : window,
+        width,
+        height,
+        nativeWidth: state.nativeWidth,
+        nativeHeight: state.nativeHeight,
+        elements,
+        ...(state.focusedElement ? { focusedElement: state.focusedElement } : {}),
+        screenshot,
+        mediaType: "image/jpeg",
+      };
+    }
     const output = await runPowerShell(
       observationScript(),
       { CC_WINDOW_ID: window.id, CC_SCREENSHOT_PATH: screenshotPath },
@@ -565,6 +741,19 @@ export async function performComputerActions(
     (total, item) => total + (item.action === "wait" ? item.durationMs : 0),
     0,
   );
+  if (process.platform === "darwin") {
+    await runMacHelper(
+      ["action", window.id],
+      {
+        CC_ACTION_INPUT: JSON.stringify(actions.length === 1 ? actions[0] : actions),
+        CC_EXPECTED_WIDTH: String(expectedSize.width),
+        CC_EXPECTED_HEIGHT: String(expectedSize.height),
+      },
+      signal,
+      Math.max(DEFAULT_TIMEOUT_MS, waitDuration + 5_000),
+    );
+    return;
+  }
   await runPowerShell(
     computerUseActionPowerShell(),
     {

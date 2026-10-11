@@ -79,7 +79,9 @@ function parseNpmJson<T>(result: CommandResult, label: string): T | undefined {
   }
 
   try {
-    return JSON.parse(result.stdout) as T;
+    const trimmed = result.stdout.trim();
+    const outerArray = trimmed.startsWith("[") ? 0 : trimmed.lastIndexOf("\n[") + 1;
+    return JSON.parse(trimmed.slice(outerArray)) as T;
   } catch (error) {
     assert(false, label, `invalid npm JSON: ${(error as Error).message}`);
     return undefined;
@@ -200,6 +202,7 @@ try {
     "README.zh-CN.md",
     "dist/ccagent.js",
     "dist/ccagent.js.map",
+    "macos/ccagent_computer_use.swift",
     "package.json",
     "rhino/TOOLKIT.md",
     "rhino/ccagent_grasshopper.py",

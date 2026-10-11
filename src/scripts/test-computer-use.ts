@@ -169,10 +169,11 @@ async function main(): Promise<void> {
   console.log("\n[1] Registry and safety policy");
   const names = new Set(getAllTools().map((tool) => tool.name));
   const orderedNames = getAllTools().map((tool) => tool.name);
-  assert(names.has("ComputerObserve") === (process.platform === "win32"), "ComputerObserve Windows registration");
-  assert(names.has("ComputerAction") === (process.platform === "win32"), "ComputerAction Windows registration");
-  assert(names.has("ComputerActionGroup") === (process.platform === "win32"), "ComputerActionGroup Windows registration");
-  assert(names.has("ComputerNavigate") === (process.platform === "win32"), "ComputerNavigate Windows registration");
+  const computerUseSupported = process.platform === "win32" || process.platform === "darwin";
+  assert(names.has("ComputerObserve") === computerUseSupported, "ComputerObserve desktop registration");
+  assert(names.has("ComputerAction") === computerUseSupported, "ComputerAction desktop registration");
+  assert(names.has("ComputerActionGroup") === computerUseSupported, "ComputerActionGroup desktop registration");
+  assert(names.has("ComputerNavigate") === computerUseSupported, "ComputerNavigate desktop registration");
   assert(
     prohibitedWindowReason({ id: "1", processId: 1, processName: "WindowsTerminal", title: "Terminal" }) !== null,
     "terminal windows are prohibited",
@@ -181,8 +182,16 @@ async function main(): Promise<void> {
     prohibitedWindowReason({ id: "2", processId: 2, processName: "KeePass", title: "Vault" }) !== null,
     "password managers are prohibited",
   );
+  assert(
+    prohibitedWindowReason({ id: "3", processId: 3, processName: "系统设置", title: "系统设置" }) !== null,
+    "localized macOS security settings are prohibited",
+  );
   assert(validateComputerKey("Windows+r") !== null, "Windows-key shortcuts are prohibited");
   assert(validateComputerKey("Control_L+a") === null, "ordinary keyboard chords are accepted");
+  assert(
+    validateComputerKey("Command+l") === (process.platform === "darwin" ? null : "Command-key shortcuts are available only on macOS."),
+    "Command shortcuts are accepted only on macOS",
+  );
   if (process.platform === "win32") {
     assert(
       orderedNames.indexOf("ComputerActionGroup") < orderedNames.indexOf("ComputerAction"),
@@ -286,7 +295,7 @@ async function main(): Promise<void> {
         ],
       },
       browserSnapshot,
-    )?.includes("Edit or ComboBox") === true,
+    )?.includes("editable text field or ComboBox") === true,
     "grouped page input is rejected unless the fresh snapshot target is editable",
   );
   assert(

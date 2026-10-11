@@ -72,19 +72,32 @@ function normalizeKey(p: string): string {
 }
 
 /**
+ * Resolve filesystem aliases before persisting or comparing trust identities.
+ * This matters on macOS where process.chdir("/var/...") is reported back by
+ * process.cwd() as "/private/var/...". Without realpath(), a project trusted
+ * under one spelling appears untrusted under the other.
+ */
+async function canonicalizeKey(p: string): Promise<string> {
+  const resolved = path.resolve(p);
+  const real = await fs.realpath(resolved).catch(() => resolved);
+  return normalizeKey(real);
+}
+
+/**
  * Canonical key for a working directory: the enclosing git repo root when
  * present, otherwise the absolute cwd. Normalized to forward slashes.
  */
 export async function getProjectKey(cwd: string): Promise<string> {
   const gitRoot = await findGitRoot(cwd).catch(() => null);
+  const [cwdKey, homeKey, gitRootKey] = await Promise.all([
+    canonicalizeKey(cwd),
+    canonicalizeKey(os.homedir()),
+    gitRoot ? canonicalizeKey(gitRoot) : Promise.resolve(null),
+  ]);
   // A `.git` directory at the OS home must not collapse every descendant
   // project into one trust identity. Otherwise trusting any folder below the
   // home directory would silently trust all sibling folders as well.
-  const safeGitRoot =
-    gitRoot && normalizeKey(gitRoot) !== normalizeKey(os.homedir())
-      ? gitRoot
-      : null;
-  return normalizeKey(safeGitRoot ?? cwd);
+  return gitRootKey && gitRootKey !== homeKey ? gitRootKey : cwdKey;
 }
 
 export async function getGlobalState(): Promise<GlobalState> {
@@ -147,7 +160,11 @@ export async function isProjectTrusted(cwd: string): Promise<boolean> {
   if (sessionTrusted.has(key)) return true;
   const state = await getGlobalState();
   for (const [storedKey, value] of Object.entries(state.projects)) {
-    if (value.trusted && isAncestorOrSelf(storedKey, key)) return true;
+    if (!value.trusted) continue;
+    // Canonicalize historical entries too, so trust recorded before this
+    // normalization change still works across macOS filesystem aliases.
+    const canonicalStoredKey = await canonicalizeKey(storedKey);
+    if (isAncestorOrSelf(canonicalStoredKey, key)) return true;
   }
   return false;
 }

@@ -2,7 +2,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,7 +33,10 @@ export function rhinoDesktopDirectory(): string {
 function assertUnlinked(dir: string): void {
   let cursor = path.resolve(dir);
   while (cursor !== path.dirname(cursor)) {
-    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new Error(`Rhino project refuses a linked output directory: ${cursor}`);
+    const isMacSystemAlias = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(cursor);
+    if (!isMacSystemAlias && existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+      throw new Error(`Rhino project refuses a linked output directory: ${cursor}`);
+    }
     cursor = path.dirname(cursor);
   }
 }
@@ -58,7 +61,11 @@ export function createRhinoProject(): string {
   for (const name of ["models", "previews", "snapshots", "reports", "inputs"]) {
     const subdir = path.join(dir, name); assertUnlinked(subdir); mkdirSync(subdir, { recursive: true });
   }
-  return realpathSync(dir);
+  // Keep the configured spelling on macOS (`/var` vs `/private/var`) so
+  // permission receipts and project paths remain stable. Every user-provided
+  // path component was already checked above; only Apple's fixed system alias
+  // is allowed to remain symbolic.
+  return path.resolve(dir);
 }
 
 export function getRhinoProjectDirectory(): string {

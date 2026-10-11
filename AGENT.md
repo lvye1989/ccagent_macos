@@ -55,5 +55,6 @@ Most `test:*` commands run files under `src/scripts/`, but **`test:stage30` is t
   - Anthropic provider names pass through directly
   - Other providers use `protocol` + `baseURL` + `${ENV_VAR}` interpolation for API keys
   - Relevant env vars: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `QWEN_PROTOCOL`, `QWEN_MODEL`, `QWEN_BASE_URL`, `QWEN_API_KEY`, `DASHSCOPE_BASE_URL`, `DASHSCOPE_API_KEY`, `TAVILY_API_KEY`, `bocha_API_KEY`, `WEB_SEARCH_ADAPTER`, `CCAGENT_OFFICE_ENGINE`, `CCAGENT_PYTHON`, `CCAGENT_POWERSHELL`, `CCAGENT_LIBREOFFICE`
-- **Windows Computer Use** is implemented as native `ComputerObserve` and `ComputerAction` tools. Keep the exact-window, one-action-then-reobserve loop and the high-impact confirmation floor; do not route it through MCP or a runtime skill.
+- **macOS Computer Use** uses the packaged Swift/CoreGraphics/Accessibility helper; Windows retains its PowerShell/UI Automation backend. Keep the exact-window, one-action-then-reobserve loop and the high-impact confirmation floor; do not route it through MCP or a runtime skill.
+- **Rhino on macOS** uses Rhino 8.11+ `rhinocode` with `StartScriptServer`; Windows retains the COM bridge. Both execute the same fixed packaged Python runner and structured action whitelist.
 - **Notable CLI flags:** `--print` (headless JSON output), `--plan`, `--auto`, `--permission-mode full`, `--dump-system-prompt`, `--model <name-or-profile>`.

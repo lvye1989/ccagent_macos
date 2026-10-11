@@ -11,6 +11,7 @@
     ".env.example",
     "README.md",
     "README.zh-CN.md",
+    "macos/ccagent_computer_use.swift",
     "rhino/ccagent_rhino_runner.py",
     "rhino/ccagent_rhino_architecture.py",
     "rhino/ccagent_rhino_toolkit.py",

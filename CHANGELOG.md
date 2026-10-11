@@ -35,6 +35,15 @@ All notable changes to CCAGENT are documented in this file.
 
 ### Added
 
+- Added native macOS Computer Use through a packaged Swift helper using
+  CoreGraphics window discovery/capture and the Accessibility API. The existing
+  snapshot freshness, Jev review, confirmation floors and protected-window
+  rules now apply on macOS, with Command-key browser shortcuts and localized
+  security-surface blocking.
+- Added Rhino 8.11+ automation on macOS through McNeel's official `rhinocode`
+  script server while retaining the fixed RhinoCommon runner, structured action
+  whitelist, safety snapshots and Windows COM compatibility.
+
 - Added native per-agent Open/Close controls to `/agents`, including paginated
   selection, direct commands and user-wide `agentStates` persistence. Closed
   definitions stay installed but are hidden from model discovery and rejected
