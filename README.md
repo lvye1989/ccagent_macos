@@ -62,7 +62,7 @@ Stage 36 has passed local typechecking, bundling, tarball boundary checks, isola
 
 ## Quick start
 
-Requirements: Node.js 22 or newer, npm, and credentials for at least one supported model provider.
+Requirements: Node.js 22 or newer, npm, and a CCAGENT email account. Choose official services, a personal model provider, or local Ollama for inference.
 
 Install CCAGENT globally from the npm Registry:
 
@@ -94,9 +94,32 @@ source checkout on disk.
 After installation, run the first-use setup and then start CCAGENT:
 
 ```bash
+ccagent account login
 ccagent init
 ccagent
 ```
+
+After login, settings and sessions belong to `~/.ccagent/accounts/<account-hash>/`.
+Existing data is retained and can be copied into the current account through Settings → Data Import.
+
+To use the local web interface from this checkout, run `npm run build` and then
+`npm run web`. Open the printed loopback URL. An installed package can start it
+from any project directory with `ccagent web --workspace <project-directory>`.
+The web UI and terminal CLI share the same agent engine and session storage;
+see [web/README.md](./web/README.md) for details.
+
+The CLI and local Web use the configured account service by default; self-hosting is optional.
+The account center and administration pages run in the separate `cloud/` service.
+With Node.js 24, run `npm ci`, `npm run build`, and `npm start` in that directory.
+The default origin is `http://127.0.0.1:4310`, with `/login`, `/account`, and `/admin`
+entry points. Configure the database and authentication values from
+[cloud/.env.example](./cloud/.env.example), then follow the
+[backend operations guide](./docs/backend-operations.md) for migrations and administrator setup.
+A successful build or `/api/health` response does not validate authenticated database operations.
+
+This macOS checkout incorporates upstream `codebit` commit `4edb0d9` while retaining
+native Computer Use, Rhino, audio, skill management, and on-demand tool discovery.
+The imported desktop packaging script targets Windows x64; use the CLI or local Web on macOS.
 
 `ccagent init` creates `~/.ccagent/.env` and
 `~/.ccagent/settings.json` for the current account, prompts for DeepSeek,
@@ -218,6 +241,11 @@ commands toggle one account and permission at a time:
 /powersetting qq send off
 ```
 
+Interactive `/powersetting`, `/agents`, `/mcp`, and `/agent-skill` menus stay open
+after saving and refresh their current values. Use Back to return to a list, or
+Done / Esc to exit. The mail menu also supports switching accounts and preserves
+the current page after a save. Commands with explicit arguments remain one-shot.
+
 The switches persist in the current user's settings; project settings cannot
 turn them on. A permission that is off blocks its mail operations even in Full
 Mode. These switches govern the built-in `Mail` tool; standalone scripts and
@@ -331,23 +359,90 @@ CCAGENT also supports named Anthropic, OpenAI-compatible, Gemini, and local prof
       "model": "gemini-2.5-pro",
       "apiKey": "${GEMINI_API_KEY}"
     },
+    "qwen": {
+      "protocol": "${QWEN_PROTOCOL:-openai-chat}",
+      "model": "${QWEN_MODEL:-qwen3.8-max,qwen3.8-flash}",
+      "baseURL": "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}",
+      "apiKey": "${DASHSCOPE_API_KEY}"
+    },
+    "qwen-omni": {
+      "protocol": "${QWEN_PROTOCOL:-openai-chat}",
+      "model": "${QWEN_OMNI_MODEL:-qwen3.8-omni-flash}",
+      "baseURL": "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}",
+      "apiKey": "${DASHSCOPE_API_KEY}",
+      "maxTokens": 4096
+    },
     "ollama": {
-      "protocol": "openai-chat",
-      "model": "qwen2.5-coder",
-      "baseURL": "http://localhost:11434/v1"
+      "protocol": "${OLLAMA_PROTOCOL:-openai-chat}",
+      "model": "${OLLAMA_MODEL:-qwen3.8:27b-mtp-q8_0}",
+      "baseURL": "${OLLAMA_BASE_URL:-http://127.0.0.1:11434/v1}"
     }
   }
 }
 ```
 
 Select a profile with `ccagent --model deepseek` or `/model deepseek` inside
-the REPL. `defaultModel` makes that profile the default when no explicit model
-is selected.
+the REPL. `/model` opens a paginated picker that stays open after a switch;
+`/model list` lists every choice. After selecting a model, choose **仅当前会话**
+(this session) or **保存为默认** (save as default). Saving switches immediately
+and persists `defaultModel` in the user `~/.ccagent/settings.json` for future starts.
+Use `/model save deepseek` directly, or `/model save` to save the current model.
+`/model default` restores the saved default; an explicit `--model` still overrides it.
+An upstream name such as `/model qwen3.8-flash` also resolves to its configured provider.
+
+`DEEPSEEK_MODEL`, `QWEN_MODEL`, and `OLLAMA_MODEL` accept one name or a
+comma-separated list. Every entry is selectable; requests send one selected
+model name. Use `QWEN_MODEL=qwen3.8-max,qwen3.8-flash` for the main choices and
+`QWEN_OMNI_MODEL=qwen3.8-omni-flash` as the vision fallback. Image-capable main
+models receive images directly, without an additional Omni call. Text-only
+main models keep reasoning while Omni extracts evidence from image attachments,
+Read results, Computer Use screenshots, and Rhino captures. Legacy Omni values
+in `QWEN_MODEL` remain compatible.
+
+The bundled global skill `read-audio` is installed at startup in
+`~/.ccagent/skills/read-audio/SKILL.md`, preserving existing user files.
+The old `read_audio.skill` directory migrates automatically, preserving customizations
+and switch settings; `/read_audio.skill` remains a supported alias.
+Paste an audio file path, use `@recording.wav`, or run
+`/read-audio @recording.wav summarize this recording`. Audio always goes
+to `QWEN_OMNI_MODEL` (default `qwen3.8-omni-flash`), regardless of the main
+model's image capability; the original main model receives transcript and
+sound evidence. Audio returned by `Read` follows the same route. `/agent-skill`
+controls new audio recognition; `/skills` lists the global skill.
+WAV, MP3, AMR, AAC, 3GP and 3GPP are read directly. M4A, FLAC, OGG, OPUS and
+AIFF are converted to WAV with ffmpeg, or macOS `afconvert` when available.
+Both original and converted files must fit the 7 MiB local upload limit.
+The request follows the official [Omni audio input format](https://help.aliyun.com/en/model-studio/qwen-omni).
+
+Image support is detected from known model families and Ollama's `/api/show`
+capabilities. Cloud Qwen3.5/3.6/3.7 Plus and Qwen3.8 Max/Flash support images;
+the older `qwen-plus` is text-only ([Qwen-Plus capabilities](https://help.aliyun.com/en/model-studio/qwen-plus), [multimodal families](https://help.aliyun.com/en/model-studio/web-search)). Custom deployments can override detection
+with `models.<id>.supportsVision` (boolean), or `QWEN_SUPPORTS_VISION` /
+`OLLAMA_SUPPORTS_VISION` (`true` / `false`) in `.env`.
 
 `contextWindow` is the provider's total input/output token capacity. CCAGENT
 uses it for warnings and automatic compaction; it does not invent extra model
 capacity. The bundled `deepseek-flash` profile uses `1048576` (1 Mi tokens).
 For a custom gateway or local model, set the value advertised by that provider.
+
+CCAGENT keeps tool definitions deterministic and appends date/Git-state changes
+to conversation history instead of rewriting the system prompt every turn.
+Dates use the local calendar day. Real settings, skills, and memory changes
+still update the system prompt. This helps server-side prefix-cache reuse;
+first requests, tool changes, compaction, and server cache eviction can still
+require prompt processing.
+
+Tool definitions are loaded on demand. New conversations advertise only `Read`,
+`Glob`, `Grep`, `Bash`, `AskUserQuestion`, and `ToolSearch`. Other built-ins are
+loaded by capability group; MCP searches load individual operations (three
+matches by default) rather than every server's schema. `ToolSearch` accepts a
+task/name query, a group, or exact names; no arguments lists available groups
+and connected services. Real schemas appear on the next model request.
+Selections persist within the conversation for prefix-cache reuse, reset on
+`/clear`, and rehydrate from resumed history. Disabled tools disappear
+immediately. Discovery neither executes tools nor grants permissions or expands
+a child agent's allowed pool. `/context` and `/status` show loaded tool counts.
+
 `CCAGENT_MAX_CONTEXT_TOKENS` remains available as a process-wide override.
 
 CCAGENT automatically micro-compacts old tool output and summarizes history
@@ -382,8 +477,12 @@ manual summary, and `/context` shows the resolved window and current estimate.
 | `GOOGLE_MCP_CLIENT_SECRET` | OAuth client secret for Google Workspace MCP; never stored in `settings.json` |
 | `CCAGENT_QQ_MAIL_ADDRESS` / `CCAGENT_163_MAIL_ADDRESS` | Optional personal QQ / 163 mailbox addresses for the built-in `Mail` tool |
 | `CCAGENT_QQ_MAIL_AUTH_CODE` / `CCAGENT_163_MAIL_AUTH_CODE` | Provider-issued client authorization codes for IMAP/SMTP, stored only in the private environment file |
-| `QWEN_PROTOCOL` | Optional Computer Use perception protocol; the verified DashScope default is `openai-chat`, with `openai-responses` and `gemini` also supported |
-| `QWEN_MODEL` | Qwen/vision model used to interpret Computer Use screenshots |
+| `QWEN_PROTOCOL` | Shared Qwen text/Omni protocol; the verified DashScope default is `openai-chat`, with `openai-responses` and `gemini` also supported |
+| `QWEN_MODEL` | Qwen main models; defaults to `qwen3.8-max,qwen3.8-flash`, first entry uses the `qwen` handle |
+| `QWEN_OMNI_MODEL` | Vision fallback used with text-only main models; defaults to `qwen3.8-omni-flash` |
+| `QWEN_SUPPORTS_VISION` / `OLLAMA_SUPPORTS_VISION` | Optional image-input capability override (`true` / `false`); automatic when omitted |
+| `OLLAMA_MODEL` | One Ollama model or a comma-separated list |
+| `OLLAMA_PROTOCOL` / `OLLAMA_BASE_URL` | Ollama protocol/endpoint; defaults to `openai-chat` / `http://127.0.0.1:11434/v1` |
 | `DASHSCOPE_BASE_URL` / `QWEN_BASE_URL` | DashScope or compatible Qwen endpoint for screenshot perception |
 | `DASHSCOPE_API_KEY` / `QWEN_API_KEY` | API key for the Computer Use perception model |
 | `OPENROUTER_API_KEY` | OpenRouter key for Jev decisions in Computer Use, Rhino, Auto Mode, search, and Workfriend; stored in the selected private `.env` |
@@ -557,6 +656,55 @@ CCAGENT refuses to close Agent Teams while a team is active; finish the teammate
 
 Skills are also open by default. Run `/agent-skill` to choose **Open** or **Close** in a local card (no model/API call), or use `/agent-skill open`, `/agent-skill close`, and `/agent-skill status`. The user-wide `agentSkills` boolean in `~/.ccagent/settings.json` is saved for future starts and applies immediately to subsequent invocations. Close removes skill discovery/completions and the `Skill` tool, blocks `/<skill-name>`, and pauses conditional activation, including plugin skills. Installed files remain available for reopening; `/skills reload` does not reopen Skills. Agents (including `rhino_agent`), Agent Teams, MCP servers, ordinary tools and user-defined prompt commands have independent controls. Close does not erase prior conversation content, undo completed work, or revoke permissions already granted in this session; use `/clear` or start a new session if you need a fresh context.
 
+Choose **List** or run `/agent-skill list` to see installed skill names, states,
+sources, descriptions and paths. Select a skill for **Open / Close / Delete**.
+The inventory includes user, project and plugin skills, including closed, manual-only
+and conditional skills, even when the global switch is closed. Individual choices
+persist in the user `skillStates` map. Opening one skill leaves the global switch
+unchanged; opening globally preserves individual choices. The menu stays open after
+changes, and Esc returns to the parent menu. Direct commands are also available:
+
+```text
+/agent-skill open read-audio
+/agent-skill close read-audio
+/agent-skill delete <skill-name>
+```
+
+Deletion requires confirmation, or `--yes` in noninteractive mode. Files move to
+`~/.ccagent/skill-trash/`, and the command prints the backup location. Deleted built-in
+skills are not reinstalled on startup. Deleting a plugin skill moves only its
+`SKILL.md`, preserving the plugin's other components. To restore a skill, move the
+backup to the original path recorded in `restore.json`, run `/skills reload`
+(`/reload-plugins` for plugin skills), then `/agent-skill open <skill-name>`.
+
+### Built-in skill authoring and Office editing
+
+Startup installs the following skills and supporting scripts into `~/.ccagent/skills/`
+(or `CCAGENT_HOME/skills`). Existing files and customizations are preserved, and deleted
+built-ins are not reinstalled automatically.
+
+| Command | Purpose |
+| --- | --- |
+| `/skill-creator <request>` | Create or update skills with initialization and validation helpers; ordinary skill-authoring requests also load this workflow first |
+| `/word-skill <request or file>` | Create/edit Word documents, tables and templates, or work in an open Word window |
+| `/ppt-skill <request or file>` | Create/edit PowerPoint slides, templates and charts, or work in an open PowerPoint window |
+| `/excel-skill <request or file>` | Create/edit Excel workbooks, formulas and formatting, or work in an open Excel window |
+
+Final DOCX, PPTX, XLSX and requested PDF outputs default to the user's **Desktop**,
+including redirected desktop locations. An explicitly requested destination takes precedence.
+Source files and templates stay in place; scripts and previews use temporary storage.
+Manage individual skills with `/agent-skill list`. After creating a skill, run
+`/skills reload` to discover it and invoke it with `/<skill-name>`. Enabled skills also
+appear in the model's discovery list for matching natural-language requests.
+
+File editing uses `python-docx`, `python-pptx` and `openpyxl`, preferably from the isolated
+`~/.ccagent/venvs/office` environment; missing libraries are prepared as needed without
+changing system Python. The bundled `office_helper.py` needs only Python's standard
+library and provides environment probing, OOXML inspection and structural validation.
+Live application work uses existing Computer Use or available local automation interfaces.
+Structural checks do not imply visual verification or formula recalculation; only operations
+actually performed in a renderer or application are reported as verified.
+
 ### macOS Computer Use
 
 For plain search or direct navigation, start with `BrowserSearch`: it opens a validated search-results URL or HTTPS URL after one specialized Jev decision and usually completes without observing the desktop. `ComputerObserve`, `ComputerAction`, `ComputerActionGroup`, and `ComputerNavigate` remain the built-in, non-MCP desktop-control loop for workflows that must inspect or interact with a page:
@@ -571,7 +719,7 @@ Before the first macOS input, CCAGENT displays a **“ccagent正在控制电脑�
 
 The first observation/action requires macOS permissions for the terminal or application that launches CCAGENT: enable **Privacy & Security → Accessibility** for input control and **Privacy & Security → Screen Recording** for window capture. The packaged Swift helper is compiled once into `~/.ccagent/bin/` using the installed Xcode Command Line Tools and is content-hash versioned across upgrades.
 
-The recommended pairing is DeepSeek as the main reasoning/text model and Qwen as a perception-only model. Configure the `QWEN_*`/`DASHSCOPE_*` variables above, or point `modelRoles.computerUse` (also accepts `computer_use`, `vision`, `image`, or `multimodal`) at a declared model profile. In automatic delivery mode, a successful Qwen description is returned to DeepSeek without attaching the screenshot to the DeepSeek turn.
+Text-only main models such as DeepSeek pair with Qwen for perception. Configure the `QWEN_*`/`DASHSCOPE_*` variables above, or point `modelRoles.computerUse` (also accepts `computer_use`, `vision`, `image`, or `multimodal`) at a declared vision profile. In automatic delivery mode, the description returns to the main model without attaching the screenshot. Image-capable main models receive screenshots directly; they do not invoke the fallback Omni model. Explicit `perception="on"` uses the image-capable main model for a separate evidence pass.
 
 When `OPENROUTER_API_KEY` is configured, CCAGENT adds Jev as a typed decision gate between an LLM-proposed `ComputerAction`/`ComputerActionGroup` and the permission/execution path. It calls OpenRouter's Decisions API with `~typesafe/jev-latest`, batches target validity, goal alignment, prompt-injection, disposition, and risk questions, and sends text/structured state only—never the screenshot or the text being typed. A group receives exactly one Jev request and cannot silently fall back to unreviewed multi-action execution. Jev can raise but never lower the LLM-declared risk. A confident ordinary decision avoids a second general-purpose Auto Mode classifier call; uncertainty, high-impact classification, or disagreement falls back to re-observation, existing permission prompts, or single-action execution. Each executed result records both the Jev gate and `final_permission`, so `execute` in the raw answer is no longer confused with final authorization. Every request requires ZDR and denies provider data collection. `ComputerActionGroup` requires `CCAGENT_JEV_MODE=enforce`; shadow/off mode keeps the single-action path.
 
@@ -619,7 +767,7 @@ Run `ccagent --help` for every startup option. Useful REPL commands include:
 | `/memory` | Inspect or edit project memory |
 | `/workfriend` | Start the built-in work/mood check-in and persistent end-of-day companion |
 | `/agent-team [open\|close]` | Open or close Agent Teams; no argument shows an interactive choice |
-| `/agent-skill [open\|close\|status]` | Open or close Skills; no argument shows a local interactive choice |
+| `/agent-skill [list\|open [name]\|close [name]\|delete <name>\|status]` | Manage the global switch and open, close or delete individual installed skills |
 
 ## Capabilities
 

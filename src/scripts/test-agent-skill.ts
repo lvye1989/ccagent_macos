@@ -24,9 +24,11 @@ function check(value: unknown, label: string): void {
 }
 
 const taskRoot = await fs.mkdtemp(path.join(os.tmpdir(), "ccagent-skill-switch-"));
+const { loginForTest } = await import("./helpers/accountFixture.js");
 const previousHome = process.env.CCAGENT_HOME;
 const previousFetch = globalThis.fetch;
 process.env.CCAGENT_HOME = path.join(taskRoot, "user");
+const accountFixture = await loginForTest(process.env.CCAGENT_HOME);
 globalThis.fetch = async () => { throw new Error("Unexpected network request from local skill control"); };
 const settingsPath = path.join(process.env.CCAGENT_HOME, "settings.json");
 const settings = async () => JSON.parse(await fs.readFile(settingsPath, "utf8")) as Record<string, unknown>;
@@ -100,7 +102,7 @@ try {
   const closedText = await fs.readFile(settingsPath, "utf8");
   check((await command("/agent-skill status")).includes("Close"), "Status reads effective state");
   check((await command("/agent-skill invalid")).includes("Usage:"), "Invalid argument rejected");
-  check((await command("/agent-skill open extra")).includes("Usage:"), "Extra arguments rejected");
+  check((await command("/agent-skill open extra unexpected")).includes("Usage:"), "Extra arguments rejected");
   check((await menu()).includes("Close"), "Noninteractive bare command only reports status");
   check((await menu(async () => null)).includes("cancelled"), "Esc/cancel leaves setting unchanged");
   check((await menu(async (req) => ({ answers: { [req.questions[0].question]: "maybe" } }))).includes("cancelled"), "Unrecognized free text cannot enable skills");
@@ -108,19 +110,24 @@ try {
   check(await fs.readFile(settingsPath, "utf8") === closedText && !isAgentSkillsEnabled(), "Read-only/cancel/invalid paths never write settings");
 
   let cardCount = 0;
+  const menuAnswers = ["Open", "Close", "Open", null, "Close", null];
   const interactiveEngine = new QueryEngine({ model: "test-no-network", toolContext: { ...context,
     requestUserQuestion: async (req) => {
-      cardCount++;
       const q = req.questions[0];
-      assert.deepEqual(q.options.map((o) => o.label), ["Open", "Close"]);
-      return { answers: { [q.question]: cardCount === 1 ? "Open" : "Close" } };
+      assert.ok(cardCount < menuAnswers.length, "Menu must exit on cancellation");
+      const answer = menuAnswers[cardCount++];
+      assert.deepEqual(q.options.map((o) => o.label), ["Open", "Close", "List"]);
+      assert.equal(q.cancelLabel, "完成设置");
+      if (cardCount === 2) assert.ok(q.question.includes("当前为 Open"));
+      if (cardCount === 3) assert.ok(q.question.includes("当前为 Close"));
+      return answer === null ? null : { answers: { [q.question]: answer } };
     },
   } });
-  check((await command("/agent-skill", interactiveEngine)).includes("Open") && cardCount === 1, "Real engine displays one native Open/Close card, no LLM");
+  check((await command("/agent-skill", interactiveEngine)).includes("Open") && cardCount === 4, "Real engine keeps the settings card open across repeated saves, no LLM");
   check(isAgentSkillsEnabled() && (await settings()).agentSkills === true, "Interactive Open takes effect and persists");
   check(getModelVisibleSkills().some((s) => s.name === "plugin:fixture"), "Open restores retained plugin definitions");
   check(activateConditionalSkillsForPaths(["src/a.ts"], taskRoot).includes("conditional-fixture"), "Open restores conditional activation");
-  check((await command("/agent-skill", interactiveEngine)).includes("Close") && cardCount === 2, "Interactive Close also works");
+  check((await command("/agent-skill", interactiveEngine)).includes("Close") && cardCount === 6, "Interactive Close also works and exits explicitly");
   check((await command("/config set agentSkills true")).includes("Setting updated") && isAgentSkillsEnabled(), "User /config write applies the same live switch");
   check((await command("/config set agentSkills false --project")).includes("user-only"), "Project config cannot overwrite user-wide preference");
   check((await command("/config set agentSkills false --local")).includes("user-only"), "Local config cannot overwrite user-wide preference");
@@ -144,6 +151,7 @@ try {
   check(isAgentSkillsEnabled() && getAllTools().includes(skillTool), "Saved Open survives startup bootstrap");
   console.log(`\nAll ${checks} Agent Skills checks passed (no model/network calls).`);
 } finally {
+  await accountFixture.close();
   clearSkills();
   globalThis.fetch = previousFetch;
   if (previousHome === undefined) delete process.env.CCAGENT_HOME;

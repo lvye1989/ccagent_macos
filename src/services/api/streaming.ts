@@ -17,6 +17,8 @@ import {
 } from "./client.js";
 import { resolveProfile } from "./providers/profile.js";
 import { streamViaProvider, collectViaProvider } from "./providers/providerStream.js";
+import { randomUUID } from "node:crypto";
+import { PlatformServiceError } from "../../platform/gatewayClient.js";
 import type {
   AssistantMessage,
   ContentBlock,
@@ -37,6 +39,9 @@ import {
   getSessionEffortLevel,
 } from "../../utils/thinking.js";
 import { writeStreamDebug } from "../../utils/streamDebug.js";
+import { stabilizeToolDefinitions } from "./toolDefinitions.js";
+import { prepareMessagesForVision } from "../vision/analyzeImage.js";
+import { prepareMessagesForAudio } from "../audio/analyzeAudio.js";
 import {
   classifyAPIError,
   getUserFacingErrorMessage,
@@ -53,7 +58,13 @@ import {
 // ─── Request Parameters ────────────────────────────────────────────
 
 export interface StreamRequestParams {
+  /** One logical request keeps its identity across retries and result recovery. */
+  platformRequestId?: string;
   messages: MessageParam[];
+  /** Working directory for trusted model settings and fallback vision routing. */
+  cwd?: string;
+  /** Internal single-shot Omni audio input, serialized by the Chat adapter. */
+  inputAudio?: { data: string; format: string };
   model?: string;
   maxTokens?: number;
   system?: string;
@@ -110,7 +121,9 @@ async function* streamOnce(
   // (OpenAI Chat/Responses, Gemini) are translated at the edge via llm-bridge;
   // the Anthropic path below is unchanged except it sources its client/model
   // from the (possibly synthetic) profile.
-  const profile = await resolveProfile(params.model ?? DEFAULT_MODEL);
+  const profile = await resolveProfile(params.model ?? DEFAULT_MODEL, params.cwd);
+  params = { ...params, messages: await prepareMessagesForAudio(params.messages, params.cwd ?? process.cwd(), params.signal) };
+  params = { ...params, messages: await prepareMessagesForVision(params.messages, profile, params.cwd ?? process.cwd(), params.signal) };
   if (profile.protocol !== "anthropic") {
     return yield* streamViaProvider(profile, params);
   }
@@ -174,7 +187,7 @@ async function* streamOnce(
     messages: normalizedMessages,
     stream: true as const,
     ...(params.system && { system: params.system }),
-    ...(params.tools && params.tools.length > 0 && { tools: params.tools }),
+    ...(params.tools && params.tools.length > 0 && { tools: stabilizeToolDefinitions(params.tools) }),
     ...(params.toolChoice && { tool_choice: params.toolChoice }),
   };
   // Pass thinking / output_config as extra body entries to avoid strict-SDK
@@ -450,6 +463,7 @@ async function* streamOnce(
 export async function* streamMessage(
   params: StreamRequestParams,
 ): AsyncGenerator<StreamEvent, StreamResult> {
+  params = { ...params, platformRequestId: params.platformRequestId ?? randomUUID() };
   const maxRetries = getMaxRetries();
   const model = params.model ?? DEFAULT_MODEL;
   let attempt = 0;
@@ -477,6 +491,10 @@ export async function* streamMessage(
         yield value;
       }
     } catch (error) {
+      if (error instanceof PlatformServiceError) {
+        yield { type: "error", error, category: params.signal?.aborted ? "aborted" : "platform" };
+        return errorStreamResult();
+      }
       writeStreamDebug("stream_error", {
         attempt,
         message: error instanceof Error ? error.message : String(error),
@@ -543,15 +561,20 @@ function errorStreamResult(): StreamResult {
  * we don't need incremental output.
  */
 export async function createMessage(
-  params: Omit<StreamRequestParams, "signal">,
+  params: StreamRequestParams,
 ): Promise<{ content: ContentBlock[]; usage: Usage; stopReason: string }> {
-  const profile = await resolveProfile(params.model ?? DEFAULT_MODEL);
+  const profile = await resolveProfile(params.model ?? DEFAULT_MODEL, params.cwd);
+  params = { ...params, messages: await prepareMessagesForAudio(params.messages, params.cwd ?? process.cwd(), params.signal) };
+  params = { ...params, messages: await prepareMessagesForVision(params.messages, profile, params.cwd ?? process.cwd(), params.signal) };
+  params.signal?.throwIfAborted();
+  if (profile.platformService) return collectViaProvider(profile, { ...params, platformRequestId: params.platformRequestId ?? randomUUID() });
 
   // Non-Anthropic profiles have no native non-streaming primitive here; drain
   // the translated provider stream into a single result, with the same
   // transient-failure resilience as the Anthropic branch below.
   if (profile.protocol !== "anthropic") {
     return await callWithRetry(() => collectViaProvider(profile, params), {
+      signal: params.signal,
       querySource: params.querySource ?? "background",
       onRetry: ({ attempt, delayMs, category }) =>
         writeStreamDebug("createMessage_retry", { attempt, delayMs, category }),
@@ -579,9 +602,10 @@ export async function createMessage(
         ...(params.system && { system: params.system }),
         ...(params.tools && params.tools.length > 0 && { tools: params.tools }),
         ...(params.toolChoice && { tool_choice: params.toolChoice }),
-      }),
+      }, { signal: params.signal }),
     {
       querySource: params.querySource ?? "background",
+      signal: params.signal,
       onRetry: ({ attempt, delayMs, category }) =>
         writeStreamDebug("createMessage_retry", { attempt, delayMs, category }),
     },
@@ -679,6 +703,14 @@ export function normalizeMessagesForAPI(
   endpointKey?: string,
 ): MessageParam[] {
   let normalized = messages.slice();
+
+  // DeepSeek continuation state is not a signed Anthropic thinking block.
+  // Drop only that provider state when a conversation switches to Anthropic.
+  normalized = normalized.map((message) => {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+    const content = message.content.filter((block) => (block as unknown as { reasoningProvider?: string }).reasoningProvider !== "deepseek");
+    return content.length === message.content.length ? message : { ...message, content: content.length ? content : [{ type: "text" as const, text: "[No message content]" }] };
+  });
 
   // Detect an endpoint switch: signatures from the previous endpoint are
   // invalid on the new one, so strip them this request.

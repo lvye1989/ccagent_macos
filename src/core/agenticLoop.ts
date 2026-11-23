@@ -3,6 +3,7 @@
  */
 
 import type Anthropic from "@anthropic-ai/sdk";
+import { requirePlatformScope } from "../platform/account.js";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import {
   checkPermission,
@@ -15,11 +16,14 @@ import {
   type PermissionSettings,
 } from "../permissions/permissions.js";
 import { streamMessage } from "../services/api/streaming.js";
-import { ESCALATED_MAX_TOKENS, MAX_OUTPUT_TOKENS_RECOVERY_LIMIT } from "../services/api/client.js";
+import { assertApplicationProtection } from "../permissions/applicationProtection.js";
+import { DEFAULT_MAX_TOKENS, ESCALATED_MAX_TOKENS, MAX_OUTPUT_TOKENS_RECOVERY_LIMIT } from "../services/api/client.js";
+import { officialModelPrefix } from "../platform/serviceState.js";
 import type { QuerySource } from "../services/api/withRetry.js";
 import { compactMessages } from "../context/compaction.js";
-import { findEnabledToolByName, getEnabledToolManifest } from "../tools/index.js";
-import { truncateToolResult, type ToolContext, type ToolResult } from "../tools/Tool.js";
+import { findEnabledToolByName, getEnabledToolManifest, type EnabledToolManifest } from "../tools/index.js";
+import { truncateToolResult, type Tool, type ToolContext, type ToolResult } from "../tools/Tool.js";
+import { resolveToolDecisionPolicy } from "../tools/decisionPolicy.js";
 import { appendTextToContent, prependTextToContent } from "../tools/contentBlocks.js";
 import {
   preflightComputerActionGroupWithJev,
@@ -50,8 +54,10 @@ import {
   activateConditionalSkillsForPaths,
   extractToolFilePaths,
 } from "../services/skills/conditional.js";
-import { getContextWindowForModel, tokenCountWithEstimation } from "../utils/tokens.js";
+import { estimateSystemPromptTokens, estimateToolDefinitionTokens, getContextWindowForModel, tokenCountWithEstimation } from "../utils/tokens.js";
 import { resolveProfile } from "../services/api/providers/profile.js";
+import { appendRuntimeContext, type RuntimeEnvironmentContext } from "../context/runtimeContext.js";
+import { ToolDiscovery, TOOL_SEARCH_NAME } from "../tools/toolDiscovery.js";
 import { fileHistoryTrackEdit } from "../session/fileHistory.js";
 import { setToolStatus } from "../state/toolStatusStore.js";
 import * as path from "node:path";
@@ -104,6 +110,7 @@ export type AgenticLoopEvent =
   | { type: "thinking_done"; thinking: string; signature?: string }
   | { type: "redacted_thinking"; data: string }
   | { type: "tool_use_start"; id: string; name: string }
+  | { type: "tool_use_ready"; id: string; name: string; input?: unknown }
   | { type: "permission_request"; request: PermissionRequest }
   | {
       type: "tool_use_done";
@@ -114,6 +121,7 @@ export type AgenticLoopEvent =
     }
   | { type: "assistant_message"; message: MessageParam }
   | { type: "tool_result_message"; message: MessageParam }
+  | { type: "messages_updated"; messages: MessageParam[] }
   | { type: "turn_complete"; reason: LoopTerminationReason; turnCount: number }
   | { type: "token_warning"; warning: TokenWarningResult }
   | {
@@ -169,20 +177,36 @@ export interface AgenticLoopResult {
   state: LoopState;
   usage: Usage;
   lastCallUsage: Usage;
+  lastCallUsageAnchorIndex: number;
+  lastCallSystemPromptTokens?: number;
+  lastCallToolDefinitionTokens?: number;
   reason: LoopTerminationReason;
 }
 
 export interface QueryParams {
   messages: MessageParam[];
+  /** Account-bound preparation before every model call, including tool continuations. */
+  prepareMessages?: (messages: MessageParam[]) => Promise<MessageParam[]>;
   /** Raw text from this foreground human turn; never derived from transcript roles. */
   directUserTurnText?: string;
   systemPrompt?: string;
+  /** Latest workspace state, restored if in-loop compaction removed its snapshot. */
+  runtimeContext?: RuntimeEnvironmentContext;
   tools?: Anthropic.Tool[];
   /** Dynamic tool list getter — called on each API iteration to reflect mode changes. */
   getTools?: () => Anthropic.Tool[];
+  /** Shared across foreground turns; child invocations create their own scope. */
+  toolDiscovery?: ToolDiscovery;
   model: string;
   /** Resolved profile window. When omitted the loop resolves it itself. */
   contextWindow?: number;
+  /** The last completed request's usage covers history through this assistant. */
+  initialCallUsage?: Usage;
+  initialUsageAnchorIndex?: number;
+  initialSystemPromptTokens?: number;
+  initialToolDefinitionTokens?: number;
+  /** The parent just failed to summarize this history; avoid an immediate duplicate request. */
+  initialCompactionFailed?: boolean;
   abortSignal?: AbortSignal;
   toolContext: ToolContext;
   maxTurns?: number;
@@ -226,6 +250,8 @@ export interface QueryParams {
 }
 
 export interface RunToolsOptions {
+  /** Definitions advertised for this model turn, before any discovery results. */
+  advertisedToolNames?: ReadonlySet<string>;
   /** Runtime-only nested Rhino lane. Never comes from model input. */
   rhinoFastLane?: boolean;
   /** Runtime-only, exact-input-bound Jev result from the sequence preflight. */
@@ -319,10 +345,25 @@ interface ToolBatch {
  * order the model's tool_use blocks appeared in the assistant message
  * (the API also requires tool_results to follow that order).
  */
-function partitionToolCalls(blocks: ToolUseBlock[]): ToolBatch[] {
+/** Runtime scopes are capabilities, not suggestions from a model's tool schema. */
+function findContextTool(context: ToolContext, name: string): Tool | undefined {
+  if (context.scopedTools === undefined) return findEnabledToolByName(name);
+  if (context.abortSignal?.aborted) return undefined;
+  const matches = context.scopedTools.filter((tool) => tool.name === name);
+  return matches.length === 1 && matches[0]!.isEnabled() ? matches[0] : undefined;
+}
+
+function contextToolManifest(context: ToolContext): EnabledToolManifest {
+  if (context.scopedTools === undefined) return getEnabledToolManifest();
+  return { revision: 1, tools: context.scopedTools.filter((tool) => findContextTool(context, tool.name) === tool).map((tool) => ({
+    name: tool.name, description: tool.description, inputSchema: tool.inputSchema, decisionPolicy: resolveToolDecisionPolicy(tool),
+  })) };
+}
+
+function partitionToolCalls(blocks: ToolUseBlock[], context: ToolContext): ToolBatch[] {
   const batches: ToolBatch[] = [];
   for (const block of blocks) {
-    const tool = findEnabledToolByName(block.name);
+    const tool = findContextTool(context, block.name);
     const safe = !!tool?.isConcurrencySafe?.(
       (block.input as Record<string, unknown>) ?? {},
     );
@@ -360,10 +401,17 @@ async function runOneToolBlock(
   context: ToolContext,
   options: RunToolsOptions,
 ): Promise<RunOneToolReturn> {
+  await requirePlatformScope();
   let toolDispatched = false;
   let toolInput = (block.input as Record<string, unknown>) ?? {};
-  const tool = findEnabledToolByName(block.name);
-  if (!tool) {
+  if (options.advertisedToolNames && !options.rhinoFastLane && !options.advertisedToolNames.has(block.name)) {
+    return { execution: { toolUseId: block.id, toolName: block.name, toolInput, result: {
+      content: `Tool "${block.name}" was not loaded for this model turn. Use an advertised tool, or ToolSearch if this scope provides it, before calling a deferred tool.`,
+      isError: true,
+    } } };
+  }
+  const tool = findContextTool(context, block.name);
+  if (!tool || (context.agentTeamsAllowed === false && (["TeamCreate", "TeamDelete", "SendMessage", "AgentTeamMode"].includes(block.name) || (block.name === "Agent" && Boolean(toolInput.team_name || toolInput.name))))) {
     const result: ToolResult = {
       content: `Error: Tool "${block.name}" is unknown or was disabled after the model selected it. Refresh the enabled tools list before retrying.`,
       isError: true,
@@ -382,6 +430,8 @@ async function runOneToolBlock(
         throw new Error(`Rhino fast lane stopped by an explicit ${block.name} deny rule`);
       }
     }
+    // Hard application boundary precedes hooks, Full Mode and skill allow rules.
+    await assertApplicationProtection(block.name, toolInput, context);
     // ─── Stage 22: PreToolUse hooks ────────────────────────────────
     // Fire user-defined PreToolUse hooks BEFORE the permission check.
     // A hook can:
@@ -623,7 +673,7 @@ async function runOneToolBlock(
       toolInput = { ...toolInput, risk_category: jevDecision.effectiveRisk };
     }
     const rhinoToolManifest = block.name === "RhinoAction" || (options.rhinoFastLane && block.name === "RhinoInspect")
-      ? getEnabledToolManifest()
+      ? contextToolManifest(context)
       : undefined;
     const rhinoCapabilitiesStep = options.rhinoFastLane && block.name === "RhinoInspect" && toolInput.operation === "capabilities";
     const rhinoJevDecision = block.name === "RhinoAction"
@@ -676,7 +726,7 @@ async function runOneToolBlock(
       setToolStatus(block.id, "classifier");
     }
     const toolManifest = effectiveMode === "auto" && shouldUseJevToolClassifier(tool)
-      ? getEnabledToolManifest()
+      ? contextToolManifest(context)
       : undefined;
     const toolJevDecision = effectiveMode === "auto" && !jevDecision && block.name !== "RhinoAction" && block.name !== "RhinoSequence" && !options.rhinoFastLane && shouldUseJevToolClassifier(tool)
       ? await decideToolUseWithJev(
@@ -716,6 +766,7 @@ async function runOneToolBlock(
       input: toolInput,
       cwd: context.cwd,
       mode: effectiveMode,
+      applicationProtection: context.applicationProtection,
       settings: options.permissionSettings,
       sessionRules: options.sessionPermissionRules,
       messages: options.conversationMessages,
@@ -961,7 +1012,7 @@ async function runOneToolBlock(
           const observation = getCachedRhinoObservation(observationId);
           if (!observation || observation.objectsTruncated) throw new Error("Rhino batch preflight needs a fresh complete observation");
           if (steps.some(step => !(RHINO_FAST_ACTIONS as readonly string[]).includes(step.action))) throw new Error("Rhino batch contains an unsupported action");
-          return decideRhinoSequenceBatchWithJev(steps as RhinoJevBatchStep[], observation, options.conversationMessages, context.abortSignal, getEnabledToolManifest());
+          return decideRhinoSequenceBatchWithJev(steps as RhinoJevBatchStep[], observation, options.conversationMessages, context.abortSignal, contextToolManifest(context));
         },
         runRhinoFastTool: async (name: "RhinoObserve" | "RhinoInspect" | "RhinoAction", input: Record<string, unknown>, preapproval?: {
           action: string; parameters: Record<string, unknown>; observationId: string; intent?: string; decision: unknown;
@@ -1003,8 +1054,8 @@ async function runOneToolBlock(
     // in flight (for example `/mcp close`). Never dispatch the stale object
     // that was resolved before those awaits; require the same tool instance to
     // still be enabled at the final execution boundary.
-    const dispatchTool = findEnabledToolByName(block.name);
-    if (!dispatchTool || dispatchTool !== tool) {
+    const dispatchTool = findContextTool(context, block.name);
+    if (!dispatchTool || dispatchTool !== tool || (context.agentTeamsAllowed === false && (["TeamCreate", "TeamDelete", "SendMessage", "AgentTeamMode"].includes(block.name) || (block.name === "Agent" && Boolean(toolInput.team_name || toolInput.name))))) {
       if (block.name === "BrowserSearch") revokeBrowserSearchExecution(block.id, context.sessionId);
       const result: ToolResult = {
         content: `Tool "${block.name}" changed or was disabled while its execution was being reviewed. Nothing was dispatched; refresh the enabled tools list and retry.`,
@@ -1036,6 +1087,10 @@ async function runOneToolBlock(
       return { execution: { toolUseId: block.id, toolName: block.name, toolInput, result }, ...(surfacedRequest ? { permissionRequest: surfacedRequest } : {}) };
     }
 
+    // A confirmation can remain open while logout/reset/disable revokes login.
+    // Recheck immediately before dispatch, including custom and local tools.
+    await requirePlatformScope(0);
+    await assertApplicationProtection(block.name, toolInput, context);
     setToolStatus(block.id, "running");
     toolDispatched = true;
     const rawResult = await dispatchTool.call(toolInput, callContext);
@@ -1190,7 +1245,7 @@ export async function runTools(
   const executions: ToolExecutionResult[] = [];
   const permissionRequests: PermissionRequest[] = [];
 
-  for (const batch of partitionToolCalls(toolUseBlocks)) {
+  for (const batch of partitionToolCalls(toolUseBlocks, context)) {
     const results = batch.isConcurrencySafe && batch.blocks.length > 1
       ? await runBlocksConcurrently(batch.blocks, context, options)
       : await runBlocksSerially(batch.blocks, context, options);
@@ -1236,6 +1291,10 @@ async function runBlocksSerially(
 export async function* query(
   params: QueryParams,
 ): AsyncGenerator<AgenticLoopEvent, AgenticLoopResult> {
+  const availableTools = () => params.getTools ? params.getTools() : params.tools ?? [];
+  let discovery = params.toolDiscovery;
+  let discoveryInitialized = false;
+  await requirePlatformScope(0);
   const maxTurns = params.maxTurns ?? MAX_TOOL_TURNS;
   let state: LoopState = {
     messages: [...params.messages],
@@ -1246,9 +1305,19 @@ export async function* query(
     input_tokens: 0,
     output_tokens: 0,
   };
-  let lastCallUsage: Usage = {
+  let lastCallUsage: Usage = { ...(params.initialCallUsage ?? {
     input_tokens: 0,
     output_tokens: 0,
+  }) };
+  let lastCallUsageAnchorIndex = params.initialUsageAnchorIndex ?? -1;
+  let lastCallSystemPromptTokens = params.initialSystemPromptTokens;
+  let lastCallToolDefinitionTokens = params.initialToolDefinitionTokens;
+  const usageSnapshot = () => ({ lastCallUsage, lastCallUsageAnchorIndex, lastCallSystemPromptTokens, lastCallToolDefinitionTokens });
+  const invalidateUsageAnchor = () => {
+    lastCallUsage = { input_tokens: 0, output_tokens: 0 };
+    lastCallUsageAnchorIndex = -1;
+    lastCallSystemPromptTokens = undefined;
+    lastCallToolDefinitionTokens = undefined;
   };
 
   // Stop-hook re-entry guard — see the call site below for context.
@@ -1267,6 +1336,7 @@ export async function* query(
   let maxOutputTokensRecoveryCount = 0;
   let hasAttemptedReactiveCompact = false;
   let consecutiveProactiveCompactFailures = 0;
+  let skipInitialProactiveCompaction = params.initialCompactionFailed === true;
   let activeContextWindow = params.contextWindow;
   if (activeContextWindow === undefined) {
     try {
@@ -1282,16 +1352,45 @@ export async function* query(
     if (params.abortSignal?.aborted) {
       const abortedState = { ...state, aborted: true };
       yield { type: "turn_complete", reason: "aborted", turnCount: state.turnCount };
-      return { state: abortedState, usage: totalUsage, lastCallUsage, reason: "aborted" };
+      return { state: abortedState, usage: totalUsage, ...usageSnapshot(), reason: "aborted" };
     }
 
     const nextTurnCount = state.turnCount + 1;
 
+    if (params.prepareMessages) {
+      try {
+        const prepared = await params.prepareMessages(state.messages);
+        if (prepared !== state.messages) {
+          state = { ...state, messages: prepared };
+          invalidateUsageAnchor();
+          yield { type: "messages_updated", messages: [...state.messages] };
+        }
+      } catch (error) {
+        const reason = params.abortSignal?.aborted ? "aborted" : "model_error";
+        if (reason !== "aborted") yield { type: "error", error: error instanceof Error ? error : new Error(String(error)) };
+        yield { type: "turn_complete", reason, turnCount: state.turnCount };
+        return { state, usage: totalUsage, ...usageSnapshot(), reason };
+      }
+    }
+    if (params.abortSignal?.aborted) continue;
+
+    // Snapshot the schemas once: the budget and the request must describe the
+    // same tools, including MCP connections/mode changes since the last call.
+    const available = availableTools();
+    if (!discoveryInitialized) {
+      discoveryInitialized = true;
+      if (!discovery && available.some(tool => tool.name === TOOL_SEARCH_NAME)) discovery = new ToolDiscovery(availableTools);
+      discovery?.restore(params.messages, available);
+    }
+    const currentTools = discovery ? discovery.getVisibleTools(available) : available;
     // Token budget check and recovery before every API call.
     let estimatedTokens = tokenCountWithEstimation(state.messages, {
-      usage: lastCallUsage.input_tokens > 0 ? lastCallUsage : undefined,
-      usageAnchorIndex: lastCallUsage.input_tokens > 0 ? state.messages.length - 1 : undefined,
+      usage: lastCallUsage,
+      usageAnchorIndex: lastCallUsageAnchorIndex,
+      usageSystemPromptTokens: lastCallSystemPromptTokens,
+      usageToolDefinitionTokens: lastCallToolDefinitionTokens,
       systemPrompt: params.systemPrompt,
+      toolDefinitions: currentTools,
     });
     let warningState = calculateTokenWarningState(
       estimatedTokens,
@@ -1299,24 +1398,29 @@ export async function* query(
       activeContextWindow,
     );
     let compactError: unknown;
+    const skipProactiveThisIteration = skipInitialProactiveCompaction;
+    skipInitialProactiveCompaction = false;
 
     // A large user message or tool result can cross the threshold after the
     // between-turn check. Compact here before blocking, including turn one.
     if (
       (warningState.state === "error" || warningState.state === "blocking") &&
+      !skipProactiveThisIteration &&
       consecutiveProactiveCompactFailures < 3 &&
       state.messages.length > 0
     ) {
       try {
         const compactResult = await compactMessages(state.messages, undefined, {
+          signal: params.abortSignal,
           systemPrompt: params.systemPrompt,
+          toolDefinitions: currentTools,
           model: params.model,
           contextWindow: activeContextWindow,
           force: true,
         });
         if (compactResult.didCompact) {
           state = { ...state, messages: [...compactResult.messages] };
-          lastCallUsage = { input_tokens: 0, output_tokens: 0 };
+          invalidateUsageAnchor();
           consecutiveProactiveCompactFailures = 0;
           yield {
             type: "context_compacted",
@@ -1326,6 +1430,7 @@ export async function* query(
           };
           estimatedTokens = tokenCountWithEstimation(state.messages, {
             systemPrompt: params.systemPrompt,
+            toolDefinitions: currentTools,
           });
           warningState = calculateTokenWarningState(
             estimatedTokens,
@@ -1339,6 +1444,20 @@ export async function* query(
       }
     }
 
+    if (params.runtimeContext) {
+      const withRuntimeContext = appendRuntimeContext(state.messages, params.runtimeContext);
+      if (withRuntimeContext !== state.messages) {
+        state = { ...state, messages: withRuntimeContext };
+        estimatedTokens = tokenCountWithEstimation(state.messages, {
+          usage: lastCallUsage.input_tokens > 0 ? lastCallUsage : undefined,
+          usageAnchorIndex: lastCallUsage.input_tokens > 0 ? state.messages.length - 2 : undefined,
+          systemPrompt: params.systemPrompt,
+        });
+        warningState = calculateTokenWarningState(estimatedTokens, params.model, activeContextWindow);
+      }
+    }
+
+    if (params.abortSignal?.aborted) continue;
     if (warningState.state !== "normal") {
       yield { type: "token_warning", warning: warningState };
     }
@@ -1355,12 +1474,13 @@ export async function* query(
         ),
       };
       yield { type: "turn_complete", reason: "blocking_limit", turnCount: nextTurnCount };
-      return { state: { ...state, turnCount: nextTurnCount }, usage: totalUsage, lastCallUsage, reason: "blocking_limit" };
+      return { state: { ...state, turnCount: nextTurnCount }, usage: totalUsage, ...usageSnapshot(), reason: "blocking_limit" };
     }
 
-    const currentTools = params.getTools ? params.getTools() : params.tools;
+    await requirePlatformScope(0);
     const stream = streamMessage({
       messages: [...state.messages],
+      cwd: params.toolContext.cwd,
       model: params.model,
       system: params.systemPrompt,
       tools: currentTools && currentTools.length > 0 ? currentTools : undefined,
@@ -1385,12 +1505,16 @@ export async function* query(
           return {
             state: { ...state, turnCount: nextTurnCount },
             usage: totalUsage,
-            lastCallUsage,
+            ...usageSnapshot(),
             reason: "model_error",
           };
         }
 
         lastCallUsage = { ...streamResult.usage };
+        // The output is not covered by a history index until it is committed.
+        lastCallUsageAnchorIndex = -1;
+        lastCallSystemPromptTokens = params.systemPrompt ? estimateSystemPromptTokens(params.systemPrompt) : 0;
+        lastCallToolDefinitionTokens = estimateToolDefinitionTokens(currentTools);
         totalUsage.input_tokens += streamResult.usage.input_tokens;
         totalUsage.output_tokens += streamResult.usage.output_tokens;
         totalUsage.cache_creation_input_tokens =
@@ -1437,6 +1561,7 @@ export async function* query(
     }
 
     // ─── Stage 27: stream error handling (reactive compact) ──────────
+    if (params.abortSignal?.aborted) continue;
     if (streamError) {
       // Prompt-too-long → summarize the history once and retry the turn.
       // Guarded by hasAttemptedReactiveCompact so we never loop on it.
@@ -1448,7 +1573,9 @@ export async function* query(
         hasAttemptedReactiveCompact = true;
         try {
           const compactResult = await compactMessages(state.messages, undefined, {
+            signal: params.abortSignal,
             systemPrompt: params.systemPrompt,
+            toolDefinitions: currentTools,
             model: params.model,
             contextWindow: activeContextWindow,
             force: true,
@@ -1459,6 +1586,7 @@ export async function* query(
               turnCount: state.turnCount,
               aborted: false,
             };
+            invalidateUsageAnchor();
             // Clear any partially-streamed text and reset token override.
             maxOutputTokensOverride = undefined;
             yield {
@@ -1475,12 +1603,13 @@ export async function* query(
         }
       }
 
+      if (params.abortSignal?.aborted) continue;
       yield { type: "error", error: streamError.error };
       yield { type: "turn_complete", reason: "model_error", turnCount: nextTurnCount };
       return {
         state: { ...state, turnCount: nextTurnCount },
         usage: totalUsage,
-        lastCallUsage,
+        ...usageSnapshot(),
         reason: "model_error",
       };
     }
@@ -1488,8 +1617,25 @@ export async function* query(
     // ─── Stage 27: max_output_tokens two-phase recovery ──────────────
     if (stopReason === "max_tokens") {
       // Phase 1 — silent escalation: retry the SAME request at 64K without
-      // touching the message history. Fires once per truncation episode.
-      if (maxOutputTokensOverride === undefined) {
+      // touching the message history only when that can raise the real cap.
+      // Official requests are clamped to their route limit; repeating one
+      // with an equal (or smaller) cap just bills the same truncated work.
+      let canEscalate = true;
+      if (maxOutputTokensOverride === undefined && params.model.startsWith(officialModelPrefix)) {
+        try {
+          const profile = await resolveProfile(params.model, params.toolContext.cwd);
+          if (profile.platformService) {
+            const routeCap = profile.maxTokens ?? DEFAULT_MAX_TOKENS;
+            const currentCap = Math.min(routeCap, maxOutputTokensOverride ?? routeCap);
+            canEscalate = Math.min(routeCap, ESCALATED_MAX_TOKENS) > currentCap;
+          }
+        } catch {
+          // An unavailable official binding cannot establish a higher cap.
+          // Keep the partial response and use the normal continuation path.
+          canEscalate = false;
+        }
+      }
+      if (maxOutputTokensOverride === undefined && canEscalate) {
         maxOutputTokensOverride = ESCALATED_MAX_TOKENS;
         yield { type: "stream_restart", reason: "max_tokens_escalation" };
         continue; // turnCount unchanged — same turn, higher cap
@@ -1507,6 +1653,7 @@ export async function* query(
           turnCount: nextTurnCount,
           aborted: false,
         };
+        lastCallUsageAnchorIndex = state.messages.length - 1;
         yield { type: "assistant_message", message: truncatedAssistant };
         yield {
           type: "turn_usage",
@@ -1548,6 +1695,7 @@ export async function* query(
       turnCount: nextTurnCount,
       aborted: false,
     };
+    lastCallUsageAnchorIndex = state.messages.length - 1;
     yield { type: "assistant_message", message: assistantMessage };
     // Per-turn usage event — let downstream consumers (notably
     // runChildAgent → subAgentProgressStore) update live counters
@@ -1607,14 +1755,21 @@ export async function* query(
       }
 
       yield { type: "turn_complete", reason: "completed", turnCount: state.turnCount };
-      return { state, usage: totalUsage, lastCallUsage, reason: "completed" };
+      return { state, usage: totalUsage, ...usageSnapshot(), reason: "completed" };
     }
 
+    // A streamed tool name is only a draft. Expose dispatch readiness only
+    // after the entire model turn has passed the completion/parser checks.
+    for (const block of assistantContent) {
+      if (block.type === "tool_use") yield { type: "tool_use_ready", id: block.id, name: block.name, input: block.input };
+    }
     const { toolResultsMessage, executions, permissionRequests } = await runTools(
       assistantContent,
       {
         ...params.toolContext,
         abortSignal: params.abortSignal,
+        // A restricted child cannot inherit a parent's wider discovery callback.
+        discoverTools: discovery?.discover.bind(discovery),
       },
       {
         permissionMode: params.permissionMode,
@@ -1625,6 +1780,7 @@ export async function* query(
         conversationMessages: state.messages,
         directUserTurnText: params.directUserTurnText,
         model: params.model,
+        ...(discovery || params.getTools || params.tools ? { advertisedToolNames: new Set(currentTools.map((tool) => tool.name)) } : {}),
       },
     );
 
@@ -1654,7 +1810,7 @@ export async function* query(
   return {
     state,
     usage: totalUsage,
-    lastCallUsage,
+    ...usageSnapshot(),
     reason: "max_turns",
   };
   } finally {

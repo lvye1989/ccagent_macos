@@ -43,6 +43,9 @@ export interface ThinkingBlock {
   type: "thinking";
   thinking: string;
   signature?: string;
+  /** Provider state for a matching DeepSeek continuation, never Anthropic input. */
+  reasoningProvider?: "deepseek";
+  reasoningEndpoint?: string;
 }
 
 /**
@@ -75,13 +78,28 @@ export interface ImageBlock {
     | { type: "url"; url: string };
 }
 
+/** Internal attachment; replaced by Omni text evidence before any main-model request. */
+export interface AudioBlock {
+  type: "audio";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+    format: "wav" | "mp3" | "amr" | "aac" | "3gp" | "3gpp";
+  };
+  filename?: string;
+  /** Retained so resumed conversations can reuse completed skill output. */
+  evidence?: { sourceHash: string; model: string; text: string };
+}
+
 export type ContentBlock =
   | TextBlock
   | ToolUseBlock
   | ToolResultBlock
   | ThinkingBlock
   | RedactedThinkingBlock
-  | ImageBlock;
+  | ImageBlock
+  | AudioBlock;
 
 // ─── Message Types ─────────────────────────────────────────────────
 

@@ -135,6 +135,8 @@ export async function* handleConfigCommand(
     try {
       if (key === "agentStates") {
         throw new Error("Use /agents open <name> or /agents close <name> to update the user-wide agentStates preference live.");
+      } else if (key === "skillStates") {
+        throw new Error("Use /agent-skill list or /agent-skill open|close <name> to update individual skills live.");
       } else if (key === "agentSkills") {
         if (scope !== "user" || typeof value !== "boolean") {
           throw new Error("agentSkills is a user-only boolean. Use /agent-skill open or /agent-skill close.");

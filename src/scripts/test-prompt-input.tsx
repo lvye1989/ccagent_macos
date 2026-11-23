@@ -123,6 +123,13 @@ try {
   await input("@");
   check(snapshot!.fileSuggestions[0]?.isSelected, "File palette selection resets after closing");
   await input("");
+  const audioPath = path.join(root, "voice memo.wav");
+  await fs.writeFile(audioPath, Buffer.from("RIFF-audio-paste-fixture"));
+  await key(`'${audioPath}'`);
+  await pause();
+  check(snapshot!.inputValue.includes("[Audio #") && !snapshot!.inputValue.includes(audioPath), "Pasted audio file paths become compact upload chips in the real prompt hook");
+  await key("\r");
+  check(submitted.at(-1)?.includes("[Audio #") && snapshot!.inputValue === "", "Audio upload chips submit through the normal prompt path");
   questionActive = true;
   instance.rerender(element());
   await pause();
@@ -153,5 +160,6 @@ try {
   for (const key of Object.keys(process.env)) if (!(key in oldEnv)) delete process.env[key];
   Object.assign(process.env, oldEnv);
   assert.ok(path.dirname(root) === os.tmpdir() && path.basename(root).startsWith("ccagent-prompt-render-"));
-  await fs.rm(root, { recursive: true, force: true });
+  // Windows can retain recently closed filesystem handles briefly after Ink cleanup.
+  await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
 }

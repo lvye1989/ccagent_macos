@@ -28,7 +28,6 @@ import type { Usage } from "../types/message.js";
 import { createSessionId } from "../session/storage.js";
 import { DEFAULT_MODEL } from "../services/api/client.js";
 import { readMergedStringSetting } from "../utils/settings.js";
-import { getToolsApiParams } from "../tools/index.js";
 import { BUILTIN_COMMAND_NAMES } from "../commands/builtinCommandNames.js";
 import { getEnabledAgents } from "../agents/registry.js";
 import { getActiveOutputStyleName } from "../styles/registry.js";
@@ -94,6 +93,7 @@ function buildInitMessage(params: {
   sessionId: string;
   model: string;
   permissionMode: PermissionMode;
+  tools: string[];
 }): Record<string, unknown> {
   return {
     type: "system",
@@ -102,7 +102,7 @@ function buildInitMessage(params: {
     session_id: params.sessionId,
     model: params.model,
     permissionMode: params.permissionMode,
-    tools: getToolsApiParams(params.permissionMode).map((t) => t.name),
+    tools: params.tools,
     slash_commands: [...BUILTIN_COMMAND_NAMES].sort(),
     agents: getEnabledAgents().map((a) => a.agentType),
     output_style: getActiveOutputStyleName(),
@@ -165,8 +165,8 @@ function exitCodeForReason(reason: LoopTerminationReason | undefined): number {
 }
 
 /**
- * Run one headless turn and exit the process. Never returns normally — always
- * calls `process.exit` with the resolved status code.
+ * Run one headless turn and set the exit status. Let stdout and outstanding
+ * filesystem/handle cleanup finish naturally (important for Windows libuv).
  */
 export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
   const stdin = await readStdin();
@@ -176,7 +176,8 @@ export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
     process.stderr.write(
       "Error: no input. Provide a prompt via `-p \"...\"` or pipe text on stdin.\n",
     );
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const cwd = process.cwd();
@@ -192,6 +193,7 @@ export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
   const toolContext: ToolContext = {
     cwd,
     sessionId,
+    applicationProtection: true,
     // No interactive frontend in headless mode: AskUserQuestion resolves null
     // so the awaiting tool call unblocks instead of hanging.
     requestUserQuestion: async () => null,
@@ -233,10 +235,12 @@ export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
   // the init line as message #1.
   if (streaming) {
     installStreamJsonStdoutGuard();
-    writeJsonLine(buildInitMessage({ cwd, sessionId, model: resolvedModel, permissionMode: effectiveMode }));
+    writeJsonLine(buildInitMessage({ cwd, sessionId, model: resolvedModel, permissionMode: effectiveMode, tools: engine.getModelTools().map((tool) => tool.name) }));
   }
 
   let finalText = "";
+  let localCommand = false;
+  let commandFailed = false;
   let reason: LoopTerminationReason | undefined;
   let numTurns = 0;
   let totalUsage: Usage = { ...EMPTY_USAGE };
@@ -246,10 +250,17 @@ export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
     while (true) {
       const { value, done } = await run.next();
       if (done) {
-        reason = value.reason;
+        reason = value.reason ?? (value.handled && localCommand
+          ? commandFailed ? "model_error" : "completed"
+          : undefined);
         break;
       }
       switch (value.type) {
+        case "command":
+          localCommand = true;
+          commandFailed ||= value.kind === "error";
+          finalText = finalText ? `${finalText}\n\n${value.message}` : value.message;
+          break;
         case "assistant_message": {
           const text = extractAssistantText(value.message);
           if (text.trim()) finalText = text;
@@ -294,7 +305,8 @@ export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
     } else {
       process.stderr.write(`Fatal: ${message}\n`);
     }
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   // Structured formats: emit the final `result` as the last message. For
@@ -314,11 +326,12 @@ export async function runHeadless(options: RunHeadlessOptions): Promise<void> {
       usage: totalUsage,
     };
     writeJsonLine(result);
-    process.exit(exitCodeForReason(reason));
+    process.exitCode = exitCodeForReason(reason);
+    return;
   }
 
   // text (default): only the final assistant text, with a trailing newline.
   const out = finalText.endsWith("\n") ? finalText : `${finalText}\n`;
   process.stdout.write(out);
-  process.exit(exitCodeForReason(reason));
+  process.exitCode = exitCodeForReason(reason);
 }

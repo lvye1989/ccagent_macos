@@ -1,4 +1,6 @@
 import type { CommandSuggestion } from "./types.js";
+import { getInstalledSkills } from "../services/skills/registry.js";
+import { getSkillState } from "../utils/agentSkillsEnabled.js";
 
 interface PaletteEntry {
   token: string;
@@ -26,18 +28,27 @@ const MARKETPLACE_ACTIONS: PaletteEntry[] = [
   { token: "remove", description: "Remove a registered marketplace", completionOnly: true },
 ];
 
+const SKILL_ACTIONS: PaletteEntry[] = [
+  { token: "list", description: "List installed skills and manage each skill" },
+  { token: "open", description: "Open all Skills, or append an installed skill name" },
+  { token: "close", description: "Close all Skills, or append an installed skill name" },
+  { token: "delete", description: "Delete an installed skill with confirmation", completionOnly: true },
+  { token: "status", description: "Show the global Skills switch" },
+];
+
 function suggestionsFor(
   commandPrefix: string,
   entries: PaletteEntry[],
   partial: string,
+  tag: string = "plugin",
 ): CommandSuggestion[] {
   const query = partial.toLowerCase();
   return entries
-    .filter((entry) => entry.token.startsWith(query))
+    .filter((entry) => entry.token.toLowerCase().startsWith(query))
     .map((entry) => ({
       name: `${commandPrefix} ${entry.token}`,
       description: entry.description,
-      tag: "plugin",
+      tag,
       completionOnly: entry.completionOnly,
     }));
 }
@@ -46,7 +57,7 @@ function suggestionsFor(
  * Return hierarchical slash-command suggestions, or `null` when the ordinary
  * top-level palette should handle the input.
  *
- * Keeping this parser independent from React makes the `/plugin` grammar easy
+ * Keeping this parser independent from React makes nested command grammar easy
  * to extend and prevents the old "any whitespace closes suggestions" rule
  * from swallowing nested command help.
  */
@@ -57,6 +68,21 @@ export function getNestedCommandSuggestions(input: string): CommandSuggestion[] 
   const trimmed = input.trim();
   const tokens = trimmed.split(/\s+/);
   const root = (tokens[0] ?? "").toLowerCase();
+
+  if (root === "/agent-skill") {
+    if (tokens.length === 1) return trailingSpace ? suggestionsFor(root, SKILL_ACTIONS, "", "skill") : null;
+    if (tokens.length === 2 && !trailingSpace) return suggestionsFor(root, SKILL_ACTIONS, tokens[1] ?? "", "skill");
+    const action = (tokens[1] ?? "").toLowerCase();
+    if (["open", "close", "delete"].includes(action) && ((tokens.length === 2 && trailingSpace) || (tokens.length === 3 && !trailingSpace))) {
+      const partial = tokens.length === 3 ? tokens[2] ?? "" : "";
+      const skills = getInstalledSkills().sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
+        token: skill.name,
+        description: `${getSkillState(skill.name) === "open" ? "Open" : "Close"} · ${skill.source} · ${skill.description}`,
+      }));
+      return suggestionsFor(`${root} ${action}`, skills, partial, "skill");
+    }
+    return [];
+  }
 
   if (root === "/marketplace") {
     if (tokens.length === 1) {

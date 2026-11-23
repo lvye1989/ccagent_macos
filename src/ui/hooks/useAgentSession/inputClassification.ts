@@ -13,7 +13,7 @@
  */
 
 import { findSkill } from "../../../services/skills/registry.js";
-import { isAgentSkillsEnabled } from "../../../utils/agentSkillsEnabled.js";
+import { isSkillEnabled } from "../../../utils/agentSkillsEnabled.js";
 import { isAgentEnabled } from "../../../agents/preferences.js";
 import { findUserCommand } from "../../../commands/userCommands/registry.js";
 import {
@@ -40,7 +40,7 @@ export function classifyUserInput(trimmed: string): InputClassification {
   const skillCommandName = rawCommandName.toLowerCase();
   const isSkillCommand =
     isSlashCommand && !!skillCommandName && !isBuiltinCommandName(skillCommandName) &&
-    isAgentSkillsEnabled() && !!findSkill(skillCommandName);
+    isSkillEnabled(skillCommandName) && !!findSkill(skillCommandName);
   // User-defined commands also engage the full agentic loop (they expand into a
   // real prompt). Skip reserved built-in names so `/help` etc. stay synchronous
   // notices, mirroring the engine's guard.

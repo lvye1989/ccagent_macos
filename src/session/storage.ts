@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { Dirent } from "node:fs";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import type { Usage } from "../types/message.js";
+import { isRuntimeContextMessage } from "../context/runtimeContext.js";
 import { getProjectPathInfo } from "../context/memory/memdir.js";
 import { getCCAgentHome } from "../utils/paths.js";
 
@@ -79,6 +80,7 @@ export type TranscriptEntry =
   | { type: "message"; timestamp: string; role: "user" | "assistant"; message: MessageParam; messageId?: string }
   | { type: "tool_event"; timestamp: string; name: string; phase: "start" | "done"; resultLength?: number; isError?: boolean }
   | { type: "usage"; timestamp: string; turn: Usage; total: Usage }
+  | { type: "model_change"; timestamp: string; model: string }
   | { type: "system"; timestamp: string; level: "info" | "error"; message: string }
   | { type: "compaction"; timestamp: string; trigger: "auto" | "manual" }
   | { type: "file_history_snapshot"; timestamp: string; snapshot: FileHistorySnapshotRecord };
@@ -181,6 +183,13 @@ function parseJsonLine(line: string): TranscriptEntry | null {
       return null;
     }
 
+    if (parsed.type === "model_change") {
+      if (typeof parsed.timestamp === "string" && typeof parsed.model === "string" && parsed.model.trim()) {
+        return { type: "model_change", timestamp: parsed.timestamp, model: parsed.model };
+      }
+      return null;
+    }
+
     if (parsed.type === "system") {
       if (
         typeof parsed.timestamp === "string" &&
@@ -251,7 +260,7 @@ function getLastUpdatedAt(entries: TranscriptEntry[], fallback: string): string 
  * markers are stripped so a `/foo` invocation shows its text, not raw tags.
  */
 function extractFirstPrompt(messages: MessageParam[]): string {
-  const firstUser = messages.find((m) => m.role === "user");
+  const firstUser = messages.find((m) => m.role === "user" && !isRuntimeContextMessage(m));
   if (!firstUser) return "";
   const content = firstUser.content;
   let text = "";
@@ -287,6 +296,48 @@ export async function getSessionPaths(cwd: string, sessionId: string): Promise<S
     transcriptPath: path.join(info.projectDir, `${sessionId}.jsonl`),
     latestPath: path.join(info.projectDir, "latest"),
   };
+}
+
+const PINNED_FILE = "pinned-sessions.json";
+const SESSION_ID_PATTERN = /^[0-9a-f-]{36}$/;
+
+export async function listPinnedSessionIds(cwd: string): Promise<string[]> {
+  const { projectDir } = await getSessionPaths(cwd, "placeholder");
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(path.join(projectDir, PINNED_FILE), "utf8"));
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string" && SESSION_ID_PATTERN.test(value)) : [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+export async function setSessionPinned(cwd: string, sessionId: string, pinned: boolean): Promise<void> {
+  if (!SESSION_ID_PATTERN.test(sessionId)) throw new Error("Invalid session id");
+  const { projectDir, transcriptPath } = await getSessionPaths(cwd, sessionId);
+  if (!(await fs.stat(transcriptPath)).isFile()) throw new Error("Session transcript not found");
+  const ids = new Set(await listPinnedSessionIds(cwd));
+  if (pinned) ids.add(sessionId);
+  else ids.delete(sessionId);
+  await fs.writeFile(path.join(projectDir, PINNED_FILE), JSON.stringify([...ids], null, 2) + "\n", "utf8");
+}
+
+export async function deleteStoredSession(cwd: string, sessionId: string, allowMissing = false): Promise<void> {
+  if (!SESSION_ID_PATTERN.test(sessionId)) throw new Error("Invalid session id");
+  const { transcriptPath, latestPath } = await getSessionPaths(cwd, sessionId);
+  await fs.unlink(transcriptPath).catch((error: NodeJS.ErrnoException) => {
+    if (!allowMissing || error.code !== "ENOENT") throw error;
+  });
+  const pinned = new Set(await listPinnedSessionIds(cwd));
+  if (pinned.delete(sessionId)) {
+    await fs.writeFile(path.join(path.dirname(transcriptPath), PINNED_FILE), JSON.stringify([...pinned], null, 2) + "\n", "utf8");
+  }
+  const latest = await fs.readFile(latestPath, "utf8").then((value) => value.trim(), () => "");
+  if (latest === sessionId) {
+    const next = (await listProjectSessions(cwd, 1))[0]?.sessionId;
+    if (next) await fs.writeFile(latestPath, `${next}\n`, "utf8");
+    else await fs.rm(latestPath, { force: true });
+  }
 }
 
 async function ensureSessionDir(paths: SessionPaths): Promise<void> {
@@ -395,6 +446,9 @@ export async function restoreSession(cwd: string, sessionId?: string): Promise<R
   const latestUsage = [...entries]
     .reverse()
     .find((entry): entry is Extract<TranscriptEntry, { type: "usage" }> => entry.type === "usage");
+  const latestModel = [...entries]
+    .reverse()
+    .find((entry): entry is Extract<TranscriptEntry, { type: "model_change" }> => entry.type === "model_change");
 
   // Rebuild the file-history snapshot chain: keep the LAST record per
   // messageId (trackEdit appends updated copies of the most-recent snapshot
@@ -414,7 +468,7 @@ export async function restoreSession(cwd: string, sessionId?: string): Promise<R
       cwd: meta.cwd,
       startedAt: meta.startedAt,
       updatedAt: getLastUpdatedAt(entries, meta.startedAt),
-      model: meta.model,
+      model: latestModel?.model ?? meta.model,
       messageCount: messages.length,
       totalUsage: latestUsage?.total ?? createEmptyUsage(),
       firstPrompt: extractFirstPrompt(messages),
@@ -485,8 +539,10 @@ export async function applySessionRetentionPolicy(cwd: string): Promise<{ period
     }
 
     const cutoffMs = Date.now() - periodDays * 24 * 60 * 60 * 1000;
+    const pinned = periodDays === 0 ? new Set<string>() : new Set(await listPinnedSessionIds(cwd));
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      if (pinned.has(entry.name.slice(0, -6))) continue;
       const filePath = path.join(projectDir, entry.name);
       if (periodDays === 0) {
         await fs.rm(filePath, { force: true }).catch(() => {});
@@ -532,7 +588,13 @@ export async function listProjectSessions(cwd: string, limit = MAX_SESSIONS): Pr
 
   const sessions = await Promise.all(
     sessionFiles.map(async (filePath) => {
-      const transcriptEntries = await readTranscriptEntries(filePath);
+      let transcriptEntries: TranscriptEntry[];
+      try {
+        transcriptEntries = await readTranscriptEntries(filePath);
+      } catch {
+        // One locked or unreadable transcript must not hide every other task.
+        return null;
+      }
       const meta = transcriptEntries.find((entry): entry is Extract<TranscriptEntry, { type: "session_meta" }> => entry.type === "session_meta");
       if (!meta) return null;
 
@@ -540,13 +602,16 @@ export async function listProjectSessions(cwd: string, limit = MAX_SESSIONS): Pr
       const latestUsage = [...transcriptEntries]
         .reverse()
         .find((entry): entry is Extract<TranscriptEntry, { type: "usage" }> => entry.type === "usage");
+      const latestModel = [...transcriptEntries]
+        .reverse()
+        .find((entry): entry is Extract<TranscriptEntry, { type: "model_change" }> => entry.type === "model_change");
 
       return {
         sessionId: meta.sessionId,
         cwd: meta.cwd,
         startedAt: meta.startedAt,
         updatedAt: getLastUpdatedAt(transcriptEntries, meta.startedAt),
-        model: meta.model,
+        model: latestModel?.model ?? meta.model,
         messageCount: messages.length,
         totalUsage: latestUsage?.total ?? createEmptyUsage(),
         firstPrompt: extractFirstPrompt(messages.map((m) => m.message)),

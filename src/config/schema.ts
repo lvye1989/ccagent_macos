@@ -65,6 +65,7 @@ export const SettingsSchema = z.looseObject({
   agentTeams: z.boolean().optional(),
   // User-wide Skills switch. Unset means open; manage with /agent-skill.
   agentSkills: z.boolean().optional(),
+  skillStates: z.record(z.string(), z.enum(["open", "close", "deleted"])).optional(),
   // Per-definition user preference; absent names remain Open.
   agentStates: z.record(z.string(), z.enum(["open", "close"])).optional(),
   allow: z.array(PermissionRule).optional(),

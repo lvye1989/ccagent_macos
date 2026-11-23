@@ -62,7 +62,7 @@ CCAGENT 采用 37 阶段路线图，从模型通信开始，逐步构建到最�
 
 ## 快速开始
 
-运行要求：Node.js 22 或更高版本、npm，以及至少一个受支持模型服务的凭证。
+运行要求：Node.js 22 或更高版本、npm 和 CCAGENT 邮箱账户。模型可选择官方服务、自有供应商或本地 Ollama。
 
 从 npm Registry 直接全局安装 CCAGENT：
 
@@ -92,9 +92,46 @@ Registry 安装会下载已经打包的 CLI，不会在本地留下可编辑的�
 安装后先运行首次配置向导，再启动 CCAGENT：
 
 ```bash
+ccagent account login
 ccagent init
 ccagent
 ```
+
+登录后，配置及会话按账户保存在 `~/.ccagent/accounts/<账户哈希>/`。原有数据保留，可通过设置中的“数据导入”迁入当前账户。
+
+在本地源码目录运行 `npm run build`、`npm run web`，即可打开终端打印的本机 Web 地址。
+安装后的命令可在任意目录运行 `ccagent web --workspace <项目目录>`。
+Web 与终端共用任务引擎和会话存储，详见 [web/README.md](./web/README.md)。
+
+### 账户中心与管理后台
+
+账户、用量、计费及管理员页面位于独立的 `cloud/` 服务。使用 Node.js 24，在该目录运行 `npm ci`、`npm run build`、`npm start`，默认地址为 `http://127.0.0.1:4310`；登录入口是 `/login`，账户中心是 `/account`，管理后台是 `/admin`。
+
+日常 CLI/Web 默认连接预置的账户服务，无需自行部署 `cloud/`。本地 Web 的设置页与云端管理后台分别运行。自建后台的完整登录及管理操作需要按 [cloud/.env.example](./cloud/.env.example) 配置数据库和认证环境，运行数据库迁移，并为指定的已验证账户配置管理员权限。构建成功和 `/api/health` 返回正常，仅说明应用可构建和服务已启动。
+
+本 macOS 工作区已对齐上游 `codebit` 的 `4edb0d9`，继续保留原生 Computer Use、Rhino、音频、技能管理与工具按需发现。`desktop:dist` 当前仍构建 Windows x64 安装包；macOS 使用 CLI 或本地 Web。
+
+### Windows 桌面安装版
+
+`CCAGENT-Setup-<版本>-x64.exe` 提供中文安装向导、安装范围与位置选择、桌面和开始菜单快捷方式，以及卸载入口。安装完成后启动应用，按向导检查环境、选择工作文件夹、添加模型并测试连接。Node.js / npm 已包含在安装包中；Git / Bash、Python、Rhino 和部分 MCP 的其他依赖按使用的功能另行配置。模型服务仍需使用自己的接口或本地模型。
+
+桌面版复用现有 Web 与 CLI 引擎、权限和配置。用户配置默认保存到 `~/.ccagent`，桌面窗口状态位于 `%APPDATA%/CCAGENT`，项目文件位于选定工作文件夹；升级或卸载不会主动删除这些数据。桌面退出后定时任务暂停，重新打开应用后恢复到期检查。
+
+从 Windows x64 源码环境构建（Node.js 22+）：
+
+```powershell
+npm.cmd ci
+node node_modules/electron/install.js  # 仅在 npm 配置禁用安装脚本时需要
+npm.cmd run desktop:dist
+```
+
+构建脚本从官方地址取得固定版本的 Node.js，核验 SHA256，按明确的资源清单组装程序，生成安装包并复制到当前用户桌面。不会打包开发机器的 `.env`、`.ccagent`、会话或项目数据。产物同时保留在 `output/desktop/release`。
+
+开发与验证命令：`npm.cmd run desktop:prepare` 组装桌面资源，`npm.cmd run desktop:pack` 生成解包运行目录，`npm.cmd run test:desktop` 验证内置运行环境、本地服务、配置、MCP 和退出重启。可以使用 `CCAGENT_TEST_BACKEND` 指定已安装程序的 `resources/backend` 验证实际安装内容。
+
+功能或界面优化应修改 `src/`、`web/`、`desktop/` 中的源文件，然后运行检查、更新版本并重新执行 `desktop:dist`。安装 EXE 是构建成品，不作为日常修改入口。当前构建未配置受信任的代码签名证书，Windows 可能显示“未知发布者”；自动在线升级也尚未接入，升级通过新版安装包完成。
+
+### CLI 首次配置
 
 `ccagent init` 会根据当前账户自动创建 `~/.ccagent/.env` 和
 `~/.ccagent/settings.json`，交互式配置 DeepSeek、可选的 Qwen 视觉模型与
@@ -202,6 +239,10 @@ Trash 文件夹）和 `send`（发送）。它只连接预设的服务商 IMAP/S
 /powersetting qq send off
 ```
 
+`/powersetting`、`/agents`、`/mcp` 和 `/agent-skill` 的交互菜单保存后保持打开，
+可继续修改；选择“返回”可回到列表，选择“完成设置”或按 Esc 退出。邮箱菜单
+还可切换账号，翻页后保存会保留当前页。带完整参数的命令执行一次后返回。
+
 开关只保存在当前用户的设置中，项目配置不能将其开启；权限为 off 时，即使
 处于 Full Mode，对应邮件操作仍会被拦截。这些开关约束内置 `Mail` 工具；
 直接运行的脚本或其他邮箱客户端不经过该门禁。开启 `send` 仅表示允许使用发信
@@ -306,17 +347,61 @@ CCAGENT 也支持具名的 Anthropic、OpenAI 兼容、Gemini 和本地模型 Pr
       "model": "gemini-2.5-pro",
       "apiKey": "${GEMINI_API_KEY}"
     },
+    "qwen": {
+      "protocol": "${QWEN_PROTOCOL:-openai-chat}",
+      "model": "${QWEN_MODEL:-qwen3.8-max,qwen3.8-flash}",
+      "baseURL": "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}",
+      "apiKey": "${DASHSCOPE_API_KEY}"
+    },
+    "qwen-omni": {
+      "protocol": "${QWEN_PROTOCOL:-openai-chat}",
+      "model": "${QWEN_OMNI_MODEL:-qwen3.8-omni-flash}",
+      "baseURL": "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}",
+      "apiKey": "${DASHSCOPE_API_KEY}",
+      "maxTokens": 4096
+    },
     "ollama": {
-      "protocol": "openai-chat",
-      "model": "qwen2.5-coder",
-      "baseURL": "http://localhost:11434/v1"
+      "protocol": "${OLLAMA_PROTOCOL:-openai-chat}",
+      "model": "${OLLAMA_MODEL:-qwen3.8:27b-mtp-q8_0}",
+      "baseURL": "${OLLAMA_BASE_URL:-http://127.0.0.1:11434/v1}"
     }
   }
 }
 ```
 
 通过 `ccagent --model deepseek` 启动，或在 REPL 中执行 `/model deepseek`
-选择 Profile。未显式选择模型时，`defaultModel` 会将该 Profile 设为默认模型。
+选择 Profile。输入 `/model` 打开可连续选择的分页菜单，`/model list` 查看完整列表；
+也可直接输入实际模型名，如 `/model qwen3.8-flash`。在菜单中选中模型后，
+可选择 **仅当前会话** 或 **保存为默认**；后者立即切换并保存到用户
+`~/.ccagent/settings.json` 的 `defaultModel`，后续启动继续使用。
+也支持 `/model save deepseek`，或用 `/model save` 保存当前模型。
+`/model default` 恢复已保存的默认模型；显式 `--model` 参数仍可覆盖。
+
+`DEEPSEEK_MODEL`、`QWEN_MODEL`、`OLLAMA_MODEL` 可填写单个模型或逗号分隔的列表，
+每个名称都会成为单独的可选项，调用时只发送选中的一个名称。例如：
+
+```dotenv
+QWEN_MODEL=qwen3.8-max,qwen3.8-flash
+QWEN_OMNI_MODEL=qwen3.8-omni-flash
+```
+
+应用内置全局音频读取技能 `read-audio`，启动时安装到 `~/.ccagent/skills/read-audio/SKILL.md`（已有同名文件会保留）。
+旧版 `read_audio.skill` 目录会自动迁移，保留自定义内容和开关状态；原 `/read_audio.skill` 命令仍可使用。
+可粘贴音频文件路径、使用 `@录音.wav`，或执行 `/read-audio @录音.wav 请总结内容`。
+音频始终交给 `QWEN_OMNI_MODEL`（默认 `qwen3.8-omni-flash`）读取，再将转写和声音描述交给原主模型；
+`Read` 读取音频也走相同流程。用 `/skills` 查看技能，`/agent-skill` 管理开关；关闭后暂停新的音频识别。
+支持 WAV、MP3、AMR、AAC、3GP、3GPP；M4A、FLAC、OGG、OPUS、AIFF 尝试通过 ffmpeg 或 macOS 系统 afconvert 转为 WAV。
+单个原文件及转换结果均不超过 7 MiB，较长录音请拆分或压缩。接口使用官方 [Omni 音频输入格式](https://help.aliyun.com/en/model-studio/qwen-omni)。
+
+主模型支持图片输入时，直接使用主模型处理图片，不额外调用 Omni。
+主模型仅支持文本时，才组合使用 `QWEN_OMNI_MODEL` 提取图片附件、Read 结果、
+Computer Use 截图和 Rhino 截图的视觉信息，再交给原主模型继续推理。
+旧的 `QWEN_MODEL=...omni...` 配置仍兼容，建议迁移到新变量。
+
+应用根据已知模型系列及 Ollama `/api/show` 的能力声明识别图片支持情况。
+云端 Qwen3.5/3.6/3.7 Plus、Qwen3.8 Max/Flash 支持图片；旧版 `qwen-plus` 是纯文本模型（[Qwen-Plus 能力说明](https://help.aliyun.com/en/model-studio/qwen-plus)、[多模态系列说明](https://help.aliyun.com/en/model-studio/web-search)）。
+自定义部署可通过 `models.<id>.supportsVision` 布尔值，或 `.env` 中的
+`QWEN_SUPPORTS_VISION` / `OLLAMA_SUPPORTS_VISION`（`true` / `false`）覆盖自动判断。
 
 `contextWindow` 表示模型服务商提供的输入与输出总 Token 容量。CCAGENT
 会用它计算预警与自动压缩阈值，但不会凭空扩大模型本身的容量。内置的
@@ -327,6 +412,23 @@ CCAGENT 也支持具名的 Anthropic、OpenAI 兼容、Gemini 和本地模型 Pr
 CCAGENT 会在接近限制前自动清理旧工具结果并总结历史；多步骤工具循环
 执行期间也会先压缩再继续，而不是直接中断。需要提前压缩或指定总结重点时，
 仍可运行 `/compact [重点说明]`；运行 `/context` 可查看最终生效的窗口和估算占用。
+
+为了复用模型服务端的前缀缓存，CCAGENT 会保持系统提示和工具定义的顺序稳定。
+日期按本地时区的自然日表示；日期或 Git 状态变化时，以增量工作区快照追加到
+对话历史，不再每轮重写系统提示。语言、输出风格、技能和记忆的真实修改仍会
+更新系统提示。首次请求、工具增减、历史压缩及服务端缓存回收仍可能需要重新
+处理上下文。
+
+工具定义按需加载：初始只向模型发送 `Read`、`Glob`、`Grep`、`Bash`、
+`AskUserQuestion` 和 `ToolSearch`。其他内置工具按编码、网页、电脑操作、
+Rhino、文档转换、邮件、任务、规划、技能和代理等功能组加载；MCP 工具按
+具体操作发现，默认一次最多返回 3 个匹配项，不会整批发送所有服务的 Schema。
+模型可调用 `ToolSearch` 搜索任务或工具名，用 `group` 加载功能组，或不传参数
+列出当前可用的功能组与 MCP 服务。完整定义在下一次模型请求中提供。
+
+已加载的工具保留在当前会话中，`/clear` 重置，恢复会话会根据历史重新加载。
+关闭工具或服务后立即从可用定义中移除。发现工具不会执行操作、授予权限，
+也不会扩大子代理的工具范围。`/context` 和 `/status` 会显示当前实际加载数。
 
 | 环境变量 | 用途 |
 |---|---|
@@ -355,10 +457,14 @@ CCAGENT 会在接近限制前自动清理旧工具结果并总结历史；多步
 | `GOOGLE_MCP_CLIENT_SECRET` | Google Workspace MCP 的 OAuth Client Secret；不会写入 `settings.json` |
 | `CCAGENT_QQ_MAIL_ADDRESS` / `CCAGENT_163_MAIL_ADDRESS` | 内置 `Mail` 工具可选的 QQ / 163 个人邮箱地址 |
 | `CCAGENT_QQ_MAIL_AUTH_CODE` / `CCAGENT_163_MAIL_AUTH_CODE` | 服务商签发的 IMAP/SMTP 客户端授权码，只放入私有环境文件 |
-| `QWEN_PROTOCOL` | 可选 Computer Use 感知协议；DashScope 推荐并默认使用已验证的 `openai-chat`，也支持 `openai-responses` 或 `gemini` |
-| `QWEN_MODEL` | 用于理解 Computer Use 截图的 Qwen/视觉模型 |
-| `DASHSCOPE_BASE_URL` / `QWEN_BASE_URL` | DashScope 或兼容 Qwen 截图感知端点 |
-| `DASHSCOPE_API_KEY` / `QWEN_API_KEY` | Computer Use 感知模型的 API Key |
+| `QWEN_PROTOCOL` | Qwen 文本及 Omni 共用的协议；DashScope 推荐并默认使用已验证的 `openai-chat`，也支持 `openai-responses` 或 `gemini` |
+| `QWEN_MODEL` | Qwen 主模型列表，默认 `qwen3.8-max,qwen3.8-flash`；首项对应 `qwen` Profile |
+| `QWEN_OMNI_MODEL` | 仅与纯文本主模型组合使用的备用视觉模型，默认 `qwen3.8-omni-flash` |
+| `QWEN_SUPPORTS_VISION` / `OLLAMA_SUPPORTS_VISION` | 可选图片输入能力覆盖值（`true` / `false`），不填写则自动识别 |
+| `OLLAMA_MODEL` | 本地 Ollama 模型或逗号分隔的模型列表 |
+| `OLLAMA_PROTOCOL` / `OLLAMA_BASE_URL` | Ollama 协议和地址，默认 `openai-chat` / `http://127.0.0.1:11434/v1` |
+| `DASHSCOPE_BASE_URL` / `QWEN_BASE_URL` | DashScope 或兼容 Qwen 的文本与 Omni 端点 |
+| `DASHSCOPE_API_KEY` / `QWEN_API_KEY` | Qwen 文本与 Omni 共用的 API Key |
 | `OPENROUTER_API_KEY` | Computer Use、Rhino、Auto Mode、搜索与 Workfriend 的 Jev 决策所用 OpenRouter Key；保存于选定的私有 `.env` |
 | `CCAGENT_COMPUTER_USE_JEV` | 配置 OpenRouter Key 后是否启用 Jev；默认启用 |
 | `CCAGENT_COMPUTER_USE_INDICATOR` | 显示 macOS AI 控制通知（Windows 则为置顶提示与代理指针）；默认启用 |
@@ -511,6 +617,46 @@ Agent Teams 现在默认处于 Open 状态，无需启动参数即可使用 `Tea
 
 Skills 也默认 Open。输入 `/agent-skill` 可在本地卡片选择 **Open** 或 **Close**，不调用模型、无需 API；也支持 `/agent-skill open`、`/agent-skill close` 和 `/agent-skill status`。选择以布尔字段 `agentSkills` 保存到当前用户 `~/.ccagent/settings.json`，对后续调用立即生效，重启后保留。Close 会隐藏技能发现列表、技能补全和 `Skill` 工具，阻止 `/<技能名>`，并暂停按路径自动激活（含插件技能）；保留安装文件，再次 Open 即可恢复，`/skills reload` 不会擅自开启。Agent（含 `rhino_agent`）、Agent Teams、MCP、普通工具和自定义提示命令独立控制。关闭不会清除已进入会话的技能内容、撤销已完成操作或收回本会话已授予的权限；需要清空上下文时请使用 `/clear` 或新建会话。
 
+选择 **List** 或输入 `/agent-skill list`，可以查看已安装技能的名称、状态、来源、说明和文件路径，
+再选中某个技能执行 **Open / Close / Delete**。列表包含用户、项目及插件技能，也包含已关闭、
+仅手动调用和按路径触发的技能；总开关关闭时仍可管理。单个技能状态保存在用户设置的 `skillStates`，
+开启单个技能不会自动打开总开关，打开总开关也不会重置单个技能的选择。修改后菜单保持打开，
+可连续设置，Esc 返回上一级。也可直接执行：
+
+```text
+/agent-skill open read-audio
+/agent-skill close read-audio
+/agent-skill delete <技能名>
+```
+
+删除前需确认，非交互模式需添加 `--yes`。删除会将文件移入 `~/.ccagent/skill-trash/`，
+并显示恢复副本路径；内置技能删除后不会在重启时自动装回。插件技能仅移除选中技能的
+`SKILL.md`，保留插件其他组件。需要恢复时，按副本中 `restore.json` 的路径将文件移回原处，
+执行 `/skills reload`（插件技能用 `/reload-plugins`），再 `/agent-skill open <技能名>`。
+
+### 内置技能创建与 Office 编辑
+
+应用启动时会将以下技能及辅助脚本安装到 `~/.ccagent/skills/`（设置 `CCAGENT_HOME` 时使用该目录下的 `skills/`）。
+技能名称符合小写字母、数字和连字符规范；已有文件和自定义内容保留，删除过的技能不会自动装回。
+
+| 命令 | 用途 |
+| --- | --- |
+| `/skill-creator <用途>` | 创建或更新技能，提供初始化、名称及资源校验；创建技能的普通语言请求也会先加载此技能 |
+| `/word-skill <要求或文件路径>` | 创建和编辑 Word 文档、表格、模板与排版，或操作已打开的 Word |
+| `/ppt-skill <要求或文件路径>` | 创建和编辑 PowerPoint 幻灯片、模板、图形与图表，或操作已打开的 PowerPoint |
+| `/excel-skill <要求或文件路径>` | 创建和编辑 Excel 工作簿、公式、格式与图表，或操作已打开的 Excel |
+
+最终生成的 DOCX、PPTX、XLSX 及用户要求导出的 PDF 默认保存到当前用户的**桌面**；
+桌面位置会探测系统重定向，用户明确指定其他位置时遵循该路径。输入原件和模板保留在原处，临时脚本和预览放在临时目录。
+使用 `/agent-skill list` 管理单个技能。创建新技能后执行 `/skills reload`，即可使用 `/<技能名>`；
+技能也会出现在主模型的发现列表中，按任务匹配调用。
+
+Office 技能区分文件编辑与正在打开的软件操作：文件处理使用 `python-docx`、`python-pptx`、`openpyxl`，
+优先使用 `~/.ccagent/venvs/office` 隔离环境；缺少依赖时按任务准备相应库，不更改系统 Python。
+自带的 `office_helper.py` 仅需 Python 标准库，可探测环境、提取 OOXML 内容并校验文件结构。
+已打开的软件使用现有 Computer Use 或实际可用的本地自动化接口；结构校验不会冒充排版检查或 Excel 公式重算，
+只有真实执行过的应用操作、渲染及重算才会报告为已验证。
+
 ### macOS Computer Use
 
 普通搜索或直接打开网址时，优先使用 `BrowserSearch`：它经过一次专用 Jev 判断后直接打开校验过的搜索结果 URL 或 HTTPS URL，通常不需要先观察桌面。需要识别或操作网页时，再使用 `ComputerObserve`、`ComputerAction`、`ComputerActionGroup` 与 `ComputerNavigate` 构成的 macOS 内置、非 MCP 桌面控制闭环：
@@ -525,7 +671,7 @@ Skills 也默认 Open。输入 `/agent-skill` 可在本地卡片选择 **Open** 
 
 首次观察/操作需要为启动 CCAGENT 的终端或应用开启 macOS **系统设置 → 隐私与安全性 → 辅助功能**（输入控制）和 **屏幕录制**（窗口截图）。随包提供的 Swift 辅助程序会通过 Xcode Command Line Tools 首次编译到 `~/.ccagent/bin/`，并按源码哈希在升级时自动换版。
 
-推荐组合是 DeepSeek 作为主推理/文本模型，Qwen 仅作为视觉感知模型。可配置上表中的 `QWEN_*`/`DASHSCOPE_*` 环境变量，或令 `modelRoles.computerUse`（也接受 `computer_use`、`vision`、`image`、`multimodal`）指向已经声明的模型 Profile。在自动交付模式下，Qwen 成功生成视觉描述后，只把描述返回 DeepSeek，不把截图附加到 DeepSeek 回合。
+DeepSeek 等纯文本主模型可组合使用 Qwen 进行视觉感知。可配置上表中的 `QWEN_*`/`DASHSCOPE_*` 环境变量，或令 `modelRoles.computerUse`（也接受 `computer_use`、`vision`、`image`、`multimodal`）指向已经声明的视觉模型 Profile。在自动交付模式下，视觉描述返回原主模型，不把截图附加到纯文本模型回合。主模型支持图片时，截图直接交给主模型，不调用备用 Omni；显式设置 `perception="on"` 时，使用多模态主模型单独提取视觉信息。
 
 配置 `OPENROUTER_API_KEY` 后，CCAGENT 会在主 LLM 提出 `ComputerAction` 或 `ComputerActionGroup` 与权限/执行链之间增加 Jev 类型化决策门。程序通过 OpenRouter Decisions API 调用 `~typesafe/jev-latest`，一次批量判断目标是否存在、动作是否符合用户目标、是否疑似提示词注入、处置方式与实际风险。发送给 Jev 的只有文本和结构化状态，不含截图，也不含即将输入的正文。动作组严格只调用一次 Jev，不能静默回退为未经审查的多动作执行。Jev 只能提高、不能降低主 LLM 声明的风险；高置信度普通操作可避免 Auto Mode 再调用一次通用 LLM 分类器，不确定、高影响或判断冲突时会退回重新观察、现有权限确认或单动作执行。每个已执行结果都会同时记录 Jev 门禁与 `final_permission`，避免把原始 `execute` 误解为最终授权。每个请求都强制使用 ZDR 并禁止提供商收集数据。`ComputerActionGroup` 要求 `CCAGENT_JEV_MODE=enforce`；shadow/off 模式保留单动作路径。
 
@@ -573,7 +719,7 @@ git diff | ccagent -p "审查这个补丁"              # 合并 stdin 与 Promp
 | `/memory` | 检查或编辑项目记忆 |
 | `/workfriend` | 启动内置工作/心情问询和持久化的下班前回访 |
 | `/agent-team [open\|close]` | 开启或关闭 Agent Teams；不带参数时显示交互选择卡片 |
-| `/agent-skill [open\|close\|status]` | 开启或关闭 Skills；不带参数时显示本地交互选择卡片 |
+| `/agent-skill [list\|open [name]\|close [name]\|delete <name>\|status]` | 管理总开关及已安装技能；支持单独开启、关闭和删除 |
 
 ## 核心能力
 

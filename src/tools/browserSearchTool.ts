@@ -434,7 +434,7 @@ export function createBrowserSearchTool(runtime: BrowserSearchRuntime): Tool {
     name: "BrowserSearch",
     decisionPolicy: "specialized_jev",
     description:
-      "Fast one-shot path for an ordinary public search or direct URL. It needs no ComputerObserve snapshot: CCAGENT validates a fixed search-engine/HTTPS destination, Jev reviews the complete operation once, then the OS opens it in the default browser. Use WebSearch instead when the user needs facts, sources, or a summary. Use ComputerObserve/ComputerActionGroup/ComputerAction only when interaction is needed after the page opens. Never use this tool for login, CAPTCHA, forms, uploads, communication, purchases, account changes, or secret-bearing queries.",
+      "Fast one-shot path for an ordinary public search or direct URL. It needs no ComputerObserve snapshot: CCAGENT validates a fixed search-engine/HTTPS destination and Jev reviews the complete operation once. Web conversations and CLI sessions both open the OS default browser through the same execution path. Use WebSearch instead when the user needs facts, sources, or a summary. Use ComputerObserve/ComputerActionGroup/ComputerAction only when interaction is needed after the page opens. Never use this tool for login, CAPTCHA, forms, uploads, communication, purchases, account changes, or secret-bearing queries.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -500,6 +500,7 @@ export function createBrowserSearchTool(runtime: BrowserSearchRuntime): Tool {
             `destination_host=${plan.destinationHost}`,
             `requested_url=${resultUrl(plan)}`,
             "launch_status=accepted",
+            "browser_surface=os_default_browser",
             `browser_window=${detected ? `${detected.processName} detected` : "not independently detected"}`,
             "page_load=not independently verified; no screenshot, accessibility scan, or vision model was used",
             `gate=${grant.decisionSummary}`,

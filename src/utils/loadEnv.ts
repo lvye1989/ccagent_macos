@@ -23,6 +23,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import dotenv from "dotenv";
+import { getCCAgentPath } from "./paths.js";
+import { WEB_SECRET_FILE, WEB_SECRET_PREFIX } from "./webSecrets.js";
 import { isProjectTrusted } from "../config/globalState.js";
 import {
   getUserSettingsPath,
@@ -31,7 +33,8 @@ import {
 } from "./paths.js";
 
 const DEEPSEEK_API_KEY = "DEEPSEEK_API_KEY";
-const IDENTITY_KEYS = new Set(["CCAGENT_HOME", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
+const IDENTITY_KEYS = new Set(["CCAGENT_HOME", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "CCAGENT_DESKTOP_TOKEN",
+  "CCAGENT_PLATFORM_HOME", "CCAGENT_ACCOUNT_ID", "CCAGENT_WEB_WORKER_TOKEN", "CCAGENT_AUTH_SESSION_FILE", "CCAGENT_CLOUD_URL", "CCAGENT_DESKTOP_APP"]);
 const PROJECT_PROTECTED_KEYS = new Set([
   ...IDENTITY_KEYS, "CCAGENT_ENV_FILE", "NODE_OPTIONS", "NODE_PATH",
   "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -93,12 +96,29 @@ export async function loadEnv(): Promise<void> {
 
   const userSettingsPath = getUserSettingsPath();
   const userEnv = readJsonEnv(userSettingsPath);
+  let storedSecrets: Record<string, string> = {};
+  try { storedSecrets = dotenv.parse(fs.readFileSync(getCCAgentPath(WEB_SECRET_FILE))); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Cannot read the Web credential store."); }
+  for (const [name, value] of Object.entries(userEnv)) {
+    const reference = /^\$\{(CCAGENT_WEB_KEY_[A-Z0-9_]+)\}$/.exec(value);
+    if (reference) {
+      if (!storedSecrets[reference[1]!]) throw new Error("账户中的环境凭据缺失，请在设置中重新配置。");
+      userEnv[name] = storedSecrets[reference[1]!]!;
+    }
+  }
   // Relative paths owned by user settings are relative to THAT file, not an
   // arbitrary repository cwd. Shell-selected relative paths remain explicit.
   if (userEnv.CCAGENT_ENV_FILE?.trim()) {
     userEnv.CCAGENT_ENV_FILE = path.resolve(path.dirname(userSettingsPath), userEnv.CCAGENT_ENV_FILE.trim());
   }
   applyValues(userEnv, false, true);
+  // Web-created credentials are environment-backed in both entrypoints.
+  // Only our generated namespace is accepted; this file cannot set runtime flags.
+  try {
+    applyValues(Object.fromEntries(Object.entries(storedSecrets).filter(([key]) => key.startsWith(WEB_SECRET_PREFIX))), false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Cannot read the Web credential store.");
+  }
   // Pin the credential location BEFORE any project-owned data is considered.
   const configuredEnvFile = process.env.CCAGENT_ENV_FILE?.trim();
   const trusted = await isProjectTrusted(cwd);

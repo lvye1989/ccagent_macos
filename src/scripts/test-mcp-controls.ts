@@ -25,11 +25,13 @@ import { QuestionPrompt } from "../ui/components/QuestionPrompt.js";
 import { stripVTControlCharacters } from "node:util";
 
 const taskHome = await fs.mkdtemp(path.join(os.tmpdir(), "ccagent-mcp-controls-"));
+const { loginForTest } = await import("./helpers/accountFixture.js");
 const oldHome = process.env.CCAGENT_HOME;
 process.env.CCAGENT_HOME = taskHome;
+const accountFixture = await loginForTest(taskHome);
 process.env.TEST_MCP_CLIENT_ID = "test-id";
 process.env.TEST_MCP_CLIENT_SECRET = "test-secret";
-const settingsFile = path.join(taskHome, "settings.json");
+const settingsFile = path.join(accountFixture.home, "settings.json");
 let passed = 0;
 function check(value: unknown, message: string): void { assert.ok(value, message); console.log(`  OK ${++passed}. ${message}`); }
 async function until(predicate: () => boolean): Promise<void> {
@@ -148,16 +150,20 @@ try {
 
   const questions: UserQuestionRequest[] = [];
   const ui = await command(["demo"], async (request) => {
-    questions.push(request); return { answers: { [request.questions[0].question]: "Close" } };
+    questions.push(request);
+    return request.questions[0].header === "MCP switch" ? { answers: { [request.questions[0].question]: "Close" } } : null;
   });
-  check(questions[0].questions[0].options.map((o) => o.label).join() === "Open,Close" && ui.includes("Close"), "Per-server card offers Open / Close and applies selected state");
+  check(questions[0].questions[0].options.map((o) => o.label).join() === "Open,Close,返回" && questions.length === 2 && ui.includes("Close"), "Per-server card applies state and returns to the server list");
   let engineQuestions = 0;
   const engine = new QueryEngine({
     model: "test-no-network", permissionMode: "default", permissionSettings: { allow: [], deny: [], mode: "default" },
     toolContext: { cwd: taskHome, requestUserQuestion: async (request) => {
       engineQuestions++;
       const q = request.questions[0];
-      return { answers: { [q.question]: q.options.some((o) => o.label === "Close") ? "Close" : q.options[0].label } };
+      assert.ok(engineQuestions <= 5, "Menu must exit on cancellation");
+      if (engineQuestions === 5) return null;
+      const answer = q.header === "MCP switch" ? "Close" : q.options[engineQuestions === 3 ? 2 : 0].label;
+      return { answers: { [q.question]: answer } };
     } },
   });
   let engineOutput = "";
@@ -165,7 +171,7 @@ try {
     if (event.type === "command") engineOutput += event.message;
     assert.ok(event.type !== "text", "MCP menu must not invoke an LLM");
   }
-  check(engineQuestions === 2 && engineOutput.includes("Close"), "Real QueryEngine /mcp path wires both native cards without an LLM");
+  check(engineQuestions === 5 && engineOutput.includes("Close"), "Real QueryEngine /mcp supports multiple server changes before exit without an LLM");
   const stdout = new PassThrough();
   Object.assign(stdout, { columns: 90, rows: 35 });
   let frame = "";
@@ -176,7 +182,7 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 80));
   screen.unmount(); screen.cleanup();
   frame = stripVTControlCharacters(frame);
-  check(frame.includes("Open") && frame.includes("Close") && frame.includes("demo"), "Native Ink card renders server name and Open / Close choices");
+  check(frame.includes("Open") && frame.includes("Close") && frame.includes("demo") && frame.includes("完成设置") && !frame.includes("Chat about this instead"), "Native Ink card renders settings-specific Back and Done choices");
   let pageQueries = 0;
   await command([], async (request) => {
     const q = request.questions[0]; pageQueries++;
@@ -226,7 +232,7 @@ try {
   const discovered = await startMcpServer("list-auth", { ...config, oauth });
   check(discovered.type === "connected" && /Authorization required/.test(discovered.discoveryError ?? ""), "401 during tools/list reports authorization required instead of waiting five minutes");
   authAtDiscovery = false;
-  const tokenProvider = new GoogleWorkspaceOAuthProvider("127.0.0.1", oauth, { homeDir: taskHome });
+  const tokenProvider = new GoogleWorkspaceOAuthProvider("127.0.0.1", oauth, { homeDir: accountFixture.home });
   await tokenProvider.saveTokens({ access_token: "expired", token_type: "Bearer", refresh_token: "test-refresh" });
   const refreshed = await reconnectMcpServer("needs-auth");
   check(refreshed?.type === "connected" && refreshes === 1, "Stored refresh token renews silently; SDK recursive retry does not deadlock");
@@ -238,7 +244,7 @@ try {
   const fakeTransport = { finishAuth: async () => { finished++; } } as unknown as StreamableHTTPClientTransport;
   const providers = ["first", "queued"].map((name) => new GoogleWorkspaceOAuthProvider(name,
     { ...oauth, redirectUri: `http://127.0.0.1:${callbackPort}/oauth/callback` }, {
-      homeDir: taskHome, openExternal: async () => { opened++; return true; },
+      homeDir: accountFixture.home, openExternal: async () => { opened++; return true; },
     }));
   for (const provider of providers) {
     const state = provider.state(); provider.redirectToAuthorization(new URL(`https://accounts.google.test/auth?state=${state}`));
@@ -260,6 +266,7 @@ try {
   check(await fs.readFile(settingsFile, "utf8") === "{invalid settings", "Malformed user settings are never overwritten by switch persistence");
   console.log(`\n${passed} MCP control checks passed.`);
 } finally {
+  await accountFixture.close();
   await Promise.all(getMcpRegistry().map(({ connection }) => clearServerCache(connection.name, connection.config)));
   _resetMcpClientForTesting(); _resetMcpPreferencesForTesting(); clearMcpRegistry();
   await close(server);

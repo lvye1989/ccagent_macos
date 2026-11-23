@@ -45,10 +45,11 @@ function formatSettings(settings: MailPowerSettings): string {
 }
 
 async function chooseAccount(ask: Ask): Promise<MailAccount | null> {
-  const question = "选择要设置权限的邮箱（Esc 取消）：";
+  const question = "选择要设置权限的邮箱（Esc 完成设置）：";
   const response = await ask({ questions: [{
     header: "邮箱",
     question,
+    cancelLabel: "完成设置",
     options: MAIL_ACCOUNTS.map((account) => ({
       label: accountLabels[account],
       description: account === "qq" ? "单独设置 QQ 邮箱权限" : "单独设置 163 邮箱权限",
@@ -59,38 +60,43 @@ async function chooseAccount(ask: Ask): Promise<MailAccount | null> {
     : answer === "163" || answer === "163 邮箱" ? "163" : null;
 }
 
-async function choosePower(ask: Ask, account: MailAccount, settings: MailPowerSettings): Promise<MailPower | null> {
-  let page = 0;
-  const pages: readonly (readonly MailPower[])[] = [["read", "write", "delete"], ["search", "send"]];
+async function choosePower(
+  ask: Ask, account: MailAccount, settings: MailPowerSettings, cursor: { page: number },
+): Promise<MailPower | "account" | null> {
+  const pages: readonly (readonly MailPower[])[] = [["read", "write"], ["delete", "search"], ["send"]];
   for (;;) {
-    const question = `${accountLabels[account]}：选择权限（${page + 1}/${pages.length}，Esc 取消）：`;
-    const options = pages[page].map((power) => ({
+    const question = `${accountLabels[account]}：选择权限（${cursor.page + 1}/${pages.length}，Esc 完成设置）：`;
+    const options = pages[cursor.page].map((power) => ({
       label: powerShortLabels[power],
       description: `${powerLabels[power]} (${power}) · 当前 ${settings[account][power] ? "On" : "Off"}`,
     }));
-    options.push({ label: page === 0 ? "下一页" : "上一页", description: "查看其他权限" });
-    const response = await ask({ questions: [{ header: "权限", question, options }] });
+    options.push({ label: "下一页", description: "查看其他权限（循环）" });
+    options.push({ label: "切换邮箱", description: "返回邮箱列表，已保存的修改保留" });
+    const response = await ask({ questions: [{ header: "权限", question, options, cancelLabel: "完成设置" }] });
     const answer = response?.answers[question]?.trim().toLowerCase();
-    if (answer === "下一页" || answer === "上一页") {
-      page = page === 0 ? 1 : 0;
+    if (answer === "下一页") {
+      cursor.page = (cursor.page + 1) % pages.length;
       continue;
     }
-    return pages[page].find((power) => power === answer || powerShortLabels[power] === answer) ?? null;
+    if (answer === "切换邮箱") return "account";
+    return pages[cursor.page].find((power) => power === answer || powerShortLabels[power] === answer) ?? null;
   }
 }
 
-async function chooseState(ask: Ask, account: MailAccount, power: MailPower, enabled: boolean): Promise<boolean | null> {
+async function chooseState(ask: Ask, account: MailAccount, power: MailPower, enabled: boolean): Promise<boolean | "back" | null> {
   const question = `${accountLabels[account]} · ${powerLabels[power]} 当前为 ${enabled ? "On" : "Off"}，请选择：`;
   const response = await ask({ questions: [{
     header: "开关",
     question,
+    cancelLabel: "完成设置",
     options: [
       { label: "开", description: "On：开启该邮箱的这项权限" },
       { label: "关", description: "Off：关闭该邮箱的这项权限" },
+      { label: "返回", description: "返回权限列表，保留当前设置" },
     ],
   }] });
   const answer = response?.answers[question]?.trim().toLowerCase();
-  return parseState(answer);
+  return answer === "返回" ? "back" : parseState(answer);
 }
 
 /** Deterministic user-facing mailbox permission switch; never invokes a model. */
@@ -104,36 +110,53 @@ export async function* handlePowerSettingCommand(
     return { handled: true };
   }
 
-  let account: MailAccount;
-  let power: MailPower;
-  let enabled: boolean;
   if (normalized.length === 0 && ask) {
-    const settings = await loadMailPowerSettings();
-    const selectedAccount = await chooseAccount(ask);
-    const selectedPower = selectedAccount ? await choosePower(ask, selectedAccount, settings) : null;
-    const selectedState = selectedAccount && selectedPower
-      ? await chooseState(ask, selectedAccount, selectedPower, settings[selectedAccount][selectedPower])
-      : null;
-    if (!selectedAccount || !selectedPower || selectedState === null) {
-      yield { type: "command", kind: "info", message: "邮箱权限设置已取消；没有更改设置。" };
-      return { handled: true };
+    let account: MailAccount | null = null;
+    let changed = false;
+    const cursor = { page: 0 };
+    try {
+      for (;;) {
+        if (!account) {
+          account = await chooseAccount(ask);
+          cursor.page = 0;
+          if (!account) break;
+        }
+        const settings = await loadMailPowerSettings();
+        const power = await choosePower(ask, account, settings, cursor);
+        if (!power) break;
+        if (power === "account") { account = null; continue; }
+        const enabled = await chooseState(ask, account, power, settings[account][power]);
+        if (enabled === null) break;
+        if (enabled === "back") continue;
+        try {
+          await setMailPower(account, power, enabled);
+          changed = true;
+          yield { type: "command", kind: "info", message: `${accountLabels[account]} · ${powerLabels[power]}：${enabled ? "On" : "Off"}，立即生效。` };
+        } catch (error) {
+          yield { type: "command", kind: "error", message: `邮箱权限未更改：${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+    } catch (error) {
+      yield { type: "command", kind: "error", message: `邮箱权限菜单出错：${error instanceof Error ? error.message : String(error)}` };
     }
-    account = selectedAccount;
-    power = selectedPower;
-    enabled = selectedState;
-  } else if (
+    yield { type: "command", kind: "info", message: changed
+      ? `邮箱权限设置已完成，已保存的修改立即生效。\n\n${formatSettings(await loadMailPowerSettings())}`
+      : "邮箱权限设置已取消；没有更改设置。" };
+    return { handled: true };
+  }
+
+  if (!(
     normalized.length === 3 &&
     MAIL_ACCOUNTS.includes(normalized[0] as MailAccount) &&
     MAIL_POWERS.includes(normalized[1] as MailPower) &&
     parseState(normalized[2]) !== null
-  ) {
-    account = normalized[0] as MailAccount;
-    power = normalized[1] as MailPower;
-    enabled = parseState(normalized[2]) === true;
-  } else {
+  )) {
     yield { type: "command", kind: "error", message: `用法：${usage}\n例如：/powersetting qq read on` };
     return { handled: true };
   }
+  const account = normalized[0] as MailAccount;
+  const power = normalized[1] as MailPower;
+  const enabled = parseState(normalized[2]) === true;
 
   try {
     const updated = await setMailPower(account, power, enabled);

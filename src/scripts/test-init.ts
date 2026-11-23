@@ -77,7 +77,7 @@ const mergedSettings = buildUserSettings(
     deepseekModel: "deepseek-flash",
     configureQwen: true,
     qwenBaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    qwenModel: "qwen3.8-omni-flash",
+    qwenOmniModel: "qwen3.8-omni-flash",
     configureGoogleMcp: true,
     googleMcpRedirectUri: "http://127.0.0.1:53682/oauth/callback",
   },
@@ -87,6 +87,10 @@ assert(Boolean((mergedSettings.models as Record<string, unknown>).local), "unrel
 assert(
   ((mergedSettings.models as Record<string, { contextWindow?: number }>).deepseek?.contextWindow === 1_048_576),
   "DeepSeek init profile records the provider context window",
+);
+assert(
+  ((mergedSettings.models as Record<string, { model?: string }>)["qwen-plus"]?.model === "${QWEN_PLUS_MODEL:-qwen-plus}"),
+  "Qwen Plus is available as a separate text model profile",
 );
 assert(
   Object.keys(mergedSettings.mcpServers as Record<string, unknown>).filter((name) => name.startsWith("google-")).length === 8,
@@ -138,6 +142,9 @@ try {
   assert(Object.values(googleServers).filter((server) => server.url?.includes("googleapis.com/mcp/v1")).length === 8, "Google Workspace MCP entries use the eight official remote endpoints");
   assert(Object.values(googleServers).every((server) => !server.oauth || (server.oauth.clientIdEnv === "GOOGLE_MCP_CLIENT_ID" && server.oauth.clientSecretEnv === "GOOGLE_MCP_CLIENT_SECRET")), "Google MCP settings reference environment variable names instead of credentials");
   assert(env.QWEN_PROTOCOL === "openai-chat", "Qwen defaults to the verified Chat Completions protocol");
+  assert(env.QWEN_MODEL === "qwen3.8-max,qwen3.8-flash" && env.QWEN_OMNI_MODEL === "qwen3.8-omni-flash", "init separates Qwen text choices from Omni perception");
+  assert(env.OLLAMA_PROTOCOL === "openai-chat" && Boolean(env.OLLAMA_MODEL) && env.OLLAMA_BASE_URL === "http://127.0.0.1:11434/v1", "init writes the local Ollama profile variables");
+  assert(env.QWEN_PLUS_MODEL === "qwen-plus", "Qwen Plus text model is configured for CLI and Web");
   assert(env.CCAGENT_COMPUTER_USE_INDICATOR === "1", "init enables the visible Computer Use control indicator by default");
   assert(env.JEV_MODEL === "~typesafe/jev-latest" && env.CCAGENT_JEV_MODE === "enforce", "init enables OpenRouter Jev decisions for Computer Use");
   assert(env.CCAGENT_TOOL_JEV === "1" && env.JEV_TOOL_MODE === "enforce", "init enables Jev as the general Auto Mode tool classifier");

@@ -26,6 +26,8 @@
 
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import { query, type LoopTerminationReason } from "../core/agenticLoop.js";
+import { APPLICATION_PROTECTION_GUIDANCE, DESIGN_WORKFLOW_GUIDANCE } from "../context/designGuidance.js";
+import { MODEL_IDENTITY_GUIDANCE, formatMainModelIdentity } from "../context/modelIdentity.js";
 import { toolToApiParam, type Tool, type ToolContext } from "../tools/Tool.js";
 import type {
   PermissionDecision,
@@ -215,8 +217,17 @@ export async function runChildAgent(params: RunChildAgentParams): Promise<AgentR
 async function runChildAgentLoop(params: RunChildAgentParams): Promise<AgentRunResult> {
   const startTime = Date.now();
   const def = params.agentDefinition;
-  const resolved = resolveAgentTools(def, params.availableTools);
+  // A child may narrow its parent's capabilities, never regain a tool from
+  // the global pool. Match the actual tool instance and reject ambiguous
+  // names, just as the shared loop does at dispatch time.
+  const parentScope = params.parentToolContext.scopedTools;
+  const availableTools = params.availableTools.filter((tool) =>
+    tool.isEnabled() && (parentScope === undefined ||
+      (parentScope.includes(tool) && parentScope.filter((candidate) => candidate.name === tool.name).length === 1)),
+  );
+  const resolved = resolveAgentTools(def, availableTools);
   const toolApiParams = resolved.resolvedTools.map(toolToApiParam);
+  const abortSignal = params.abortSignal ?? params.parentToolContext.abortSignal;
 
   // Sub-agent gets its own session id so its TodoWrite / Task state
   // doesn't pollute the parent's. Format keeps the parent's id as a
@@ -239,8 +250,22 @@ async function runChildAgentLoop(params: RunChildAgentParams): Promise<AgentRunR
     // passes the worktree path here so EVERY sub-agent tool call
     // (Read/Write/Edit/Bash) resolves against the isolated tree.
     cwd: params.cwdOverride ?? params.parentToolContext.cwd,
-    abortSignal: params.abortSignal,
+    scopedTools: Object.freeze([...resolved.resolvedTools]),
+    officialVisionOnly: params.parentToolContext.officialVisionOnly,
+    applicationProtection: params.parentToolContext.applicationProtection,
+    conversationMainModel: params.parentToolContext.conversationMainModel,
+    abortSignal,
+    defaultModel: params.model,
     sessionId: subSessionId,
+    notificationOwnerSessionId: params.parentToolContext.notificationOwnerSessionId ?? params.parentToolContext.sessionId,
+    strictNotificationScope: params.parentToolContext.strictNotificationScope,
+    temporaryChat: params.parentToolContext.temporaryChat,
+    onModelExport: params.parentToolContext.onModelExport,
+    onToolProgress: progress => {
+      const parent = params.parentToolContext;
+      if (parent.toolUseId) parent.onToolProgress?.({ id: parent.toolUseId, name: "Agent", detail: `${progress.name}：${progress.detail}` });
+    },
+    agentTeamsAllowed: params.parentToolContext.agentTeamsAllowed,
     // Sub-agent reads its own mode — isolating plan-mode transitions
     // (Enter/ExitPlanMode) from the parent's mode state.
     getPermissionMode: () => subPermissionMode,
@@ -298,10 +323,10 @@ async function runChildAgentLoop(params: RunChildAgentParams): Promise<AgentRunR
 
   const loop = query({
     messages: initialMessages,
-    systemPrompt: def.getSystemPrompt(),
-    tools: toolApiParams,
+    systemPrompt: [def.getSystemPrompt(), MODEL_IDENTITY_GUIDANCE, formatMainModelIdentity(subToolContext.conversationMainModel), DESIGN_WORKFLOW_GUIDANCE, ...(subToolContext.applicationProtection ? [APPLICATION_PROTECTION_GUIDANCE] : [])].join("\n\n"),
+    getTools: () => resolved.resolvedTools.filter((tool) => tool.isEnabled()).map(toolToApiParam),
     model: params.model,
-    abortSignal: params.abortSignal,
+    abortSignal,
     toolContext: subToolContext,
     maxTurns: def.maxTurns ?? DEFAULT_AGENT_MAX_TURNS,
     permissionMode: subPermissionMode,

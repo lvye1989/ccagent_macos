@@ -7,22 +7,22 @@ import type { QueryEngineEvent } from "../types.js";
 type Ask = NonNullable<ToolContext["requestUserQuestion"]>;
 const usage = "/agents [list | <name> | open <name> | close <name>]";
 
-async function pickAgent(ask: Ask): Promise<string | undefined> {
+async function pickAgent(ask: Ask, cursor: { page: number }): Promise<string | undefined> {
   const all = getAllAgents();
-  let page = 0;
   const pages = Math.ceil(all.length / 3);
+  cursor.page = Math.min(cursor.page, Math.max(0, pages - 1));
   while (all.length > 0) {
-    const slice = all.slice(page * 3, page * 3 + 3);
-    const question = `选择 Agent (${page + 1}/${pages})；Esc 退出`;
+    const slice = all.slice(cursor.page * 3, cursor.page * 3 + 3);
+    const question = `选择 Agent (${cursor.page + 1}/${pages})；Esc 完成设置`;
     const options = slice.map((agent, index) => ({
       label: `${index + 1}. ${agent.agentType}`,
       description: `${isAgentEnabled(agent.agentType) ? "Open" : "Close"} · ${agent.source} · ${agent.whenToUse.slice(0, 90)}`,
     }));
     if (pages > 1) options.push({ label: "Next page", description: "下一页（循环）" });
-    const response = await ask({ questions: [{ header: "Agents", question, options }] });
+    const response = await ask({ questions: [{ header: "Agents", question, options, cancelLabel: "完成设置" }] });
     const answer = response?.answers[question];
     if (!answer) return undefined;
-    if (answer === "Next page" && pages > 1) { page = (page + 1) % pages; continue; }
+    if (answer === "Next page" && pages > 1) { cursor.page = (cursor.page + 1) % pages; continue; }
     const index = options.findIndex((option) => option.label === answer);
     if (index >= 0 && index < slice.length) return slice[index].agentType;
     // Free text must be an exact registered name; never guess which agent to change.
@@ -35,14 +35,30 @@ async function pickAgent(ask: Ask): Promise<string | undefined> {
 export async function* handleAgentControlsCommand(
   args: string[], ask?: ToolContext["requestUserQuestion"],
 ): AsyncGenerator<QueryEngineEvent, { handled: boolean }> {
+  const cursor = { page: 0 };
+  if (ask && args.length === 1) {
+    cursor.page = Math.floor(Math.max(0, getAllAgents().findIndex((agent) => agent.agentType === args[0])) / 3);
+  }
+  const interactive = Boolean(ask) && args.length <= 1;
+  let nextArgs = args;
+  for (;;) {
+    const result = yield* handleAgentSelection(nextArgs, ask, cursor);
+    if (!interactive || result.exitMenu) return { handled: true };
+    nextArgs = [];
+  }
+}
+
+async function* handleAgentSelection(
+  args: string[], ask: ToolContext["requestUserQuestion"], cursor: { page: number },
+): AsyncGenerator<QueryEngineEvent, { handled: boolean; exitMenu?: boolean }> {
   let action = "select";
   let name: string | undefined;
   try {
     if (args.length === 0 && ask) {
-      name = await pickAgent(ask);
+      name = await pickAgent(ask, cursor);
       if (!name) {
-        yield { type: "command", kind: "info", message: "Agent selection cancelled; no settings changed." };
-        return { handled: true };
+        yield { type: "command", kind: "info", message: "Agent 设置已结束，已保存的修改立即生效。" };
+        return { handled: true, exitMenu: true };
       }
     } else if (args.length === 2 && ["open", "close"].includes(args[0].toLowerCase())) {
       action = args[0].toLowerCase(); name = args[1];
@@ -58,14 +74,16 @@ export async function* handleAgentControlsCommand(
         return { handled: true };
       }
       const question = `${name} 当前为 ${isAgentEnabled(name) ? "Open" : "Close"}，请选择：`;
-      const response = await ask({ questions: [{ header: "Agent switch", question, options: [
+      const response = await ask({ questions: [{ header: "Agent switch", question, cancelLabel: "完成设置", options: [
         { label: "Open", description: "允许模型调用该 Agent；保留原工具权限和安全检查。" },
         { label: "Close", description: "隐藏并阻止该 Agent 的新任务；不删除定义，不强行中断运行中的任务。" },
+        { label: "返回", description: "返回 Agent 列表，保留当前设置。" },
       ] }] });
       const answer = response?.answers[question]?.trim().toLowerCase();
+      if (answer === "返回") return { handled: true };
       if (answer !== "open" && answer !== "close") {
-        yield { type: "command", kind: "info", message: "Agent selection cancelled; no settings changed." };
-        return { handled: true };
+        yield { type: "command", kind: "info", message: "Agent 设置已结束，已保存的修改立即生效。" };
+        return { handled: true, exitMenu: true };
       }
       action = answer;
     }
@@ -80,6 +98,7 @@ export async function* handleAgentControlsCommand(
     ].join("\n") };
   } catch (error) {
     yield { type: "command", kind: "error", message: `Could not update Agent: ${error instanceof Error ? error.message : String(error)}` };
+    return { handled: true, exitMenu: true };
   }
   return { handled: true };
 }

@@ -14,6 +14,7 @@
  */
 
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
+import type Anthropic from "@anthropic-ai/sdk";
 import type { Usage } from "../../../types/message.js";
 import type {
   PermissionMode,
@@ -24,6 +25,7 @@ import type {
 export interface CommandContext {
   /** Working directory for this session (mirrors toolContext.cwd). */
   readonly cwd: string;
+  readonly applicationProtection?: boolean;
   /** Session id, or undefined when running without persistence. */
   readonly sessionId: string | undefined;
   /** The model the engine was constructed with (before any override). */
@@ -41,6 +43,8 @@ export interface CommandContext {
   getPermissionMode(): PermissionMode;
   /** Mode to restore to on plan exit, or null when not in plan mode. */
   getPrePlanMode(): PermissionMode | null;
+  /** Definitions loaded for this conversation, rather than the whole registry. */
+  getModelTools?(): Anthropic.Tool[];
 
   /**
    * Swap the live session for a restored one (`/resume`). Encapsulates the

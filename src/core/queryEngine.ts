@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { requirePlatformScope } from "../platform/account.js";
+import { inPlatformTask } from "../platform/taskScope.js";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import {
   query,
@@ -12,15 +14,21 @@ import {
   type PermissionRuleSet,
   type PermissionSettings,
 } from "../permissions/permissions.js";
-import { buildSystemPrompt, renderSystemPrompt } from "../context/systemPrompt.js";
+import { buildSystemPrompt, getRuntimeEnvironmentContext, renderSystemPrompt } from "../context/systemPrompt.js";
+import { appendRuntimeContext } from "../context/runtimeContext.js";
+import { ToolDiscovery } from "../tools/toolDiscovery.js";
+import { chooseModel, saveDefaultModel } from "./queryEngine/commands/model.js";
+import { formatMainModelIdentity } from "../context/modelIdentity.js";
 import { compactMessages } from "../context/compaction.js";
-import { autoCompactIfNeeded, calculateTokenWarningState } from "../context/autoCompact.js";
+import { autoCompactIfNeeded, calculateTokenWarningState, createAutoCompactState, resetAutoCompactFailures } from "../context/autoCompact.js";
 import { getContextWindowForModel, tokenCountWithEstimation } from "../utils/tokens.js";
 import { formatProjectSessionHistory } from "../session/history.js";
 import { fileHistoryMakeSnapshot } from "../session/fileHistory.js";
 import { getToolsApiParams } from "../tools/index.js";
 import { buildUserMessageContent } from "./attachImages.js";
-import type { ToolContext } from "../tools/Tool.js";
+import { prepareOfficialImageReferences } from "../services/vision/officialImageReferences.js";
+import { readServiceConfiguration } from "../platform/serviceState.js";
+import { toolToApiParam, type ToolContext } from "../tools/Tool.js";
 import type { Usage } from "../types/message.js";
 import { resolveModelRole, resolveProfile, type ModelProfile } from "../services/api/providers/profile.js";
 import { getPlanFilePath, planExists as checkPlanExists } from "../context/plans.js";
@@ -28,11 +36,13 @@ import { getPlanModeAttachment, getPlanModeExitAttachment } from "../context/pla
 import { getTaskMode, setTaskMode } from "../state/taskModeStore.js";
 import { getTaskListId, resetTaskList } from "../state/taskStore.js";
 import { findSkill } from "../services/skills/registry.js";
+import { isSkillEnabled } from "../services/skills/preferences.js";
 import { isAgentSkillsEnabled } from "../utils/agentSkillsEnabled.js";
 import { handleAgentSkillCommand } from "./queryEngine/commands/agentSkill.js";
 import { isAgentEnabled, agentClosedMessage } from "../agents/preferences.js";
 import {
   drainPendingNotifications,
+  notificationScopeForContext,
   pendingNotificationCount,
 } from "../state/notificationStore.js";
 import type { Skill } from "../types/types.js";
@@ -145,7 +155,7 @@ import { buildPluginView } from "./queryEngine/commands/pluginView.js";
 export class QueryEngine {
   private messages: MessageParam[];
   private totalUsage: Usage;
-  private readonly defaultModel: string;
+  private defaultModel: string;
   private sessionModelOverride: string | null = null;
   /**
    * Stage 23: one-shot model override for a single turn, set when a user
@@ -161,9 +171,14 @@ export class QueryEngine {
   private permissionSettings?: PermissionSettings;
   private readonly sessionPermissionRules: PermissionRuleSet;
   private readonly onPermissionRequest?: (request: PermissionRequest) => Promise<PermissionDecision>;
+  private readonly maxTurns?: number;
   private abortController: AbortController | null = null;
   private usageAnchorIndex: number = -1;
   private lastCallUsage: Usage = { input_tokens: 0, output_tokens: 0 };
+  private lastCallSystemPromptTokens?: number;
+  private lastCallToolDefinitionTokens?: number;
+  private readonly autoCompactState = createAutoCompactState();
+  private lastCallModel?: string;
   private modeChangeCallback?: (mode: PermissionMode, previousMode: PermissionMode) => void;
   private needsPlanModeExitAttachment = false;
   /**
@@ -185,20 +200,48 @@ export class QueryEngine {
    */
   private currentMessageId: string | null = null;
 
+  private readonly toolDiscovery: ToolDiscovery;
+  private toolDiscoveryRestored = false;
+
   constructor(options: QueryEngineOptions) {
     this.messages = [...(options.initialMessages ?? [])];
     this.totalUsage = { ...(options.initialUsage ?? createEmptyUsage()) };
-    this.usageAnchorIndex = this.messages.length > 0 ? this.messages.length - 1 : -1;
     this.defaultModel = options.model;
     this.toolContext = options.toolContext;
     this.currentPermissionMode = options.permissionMode ?? "default";
     this.permissionSettings = options.permissionSettings;
     this.sessionPermissionRules = options.sessionPermissionRules ?? { allow: [], deny: [] };
     this.onPermissionRequest = options.onPermissionRequest;
+    if (options.maxTurns !== undefined && (!Number.isInteger(options.maxTurns) || options.maxTurns < 1 || options.maxTurns > 100)) throw new Error("maxTurns must be an integer from 1 to 100");
+    this.maxTurns = options.maxTurns;
+    this.toolDiscovery = new ToolDiscovery(() => this.getActiveTools());
+  }
+
+  /** Tool definitions visible to the current conversation. */
+  getModelTools() {
+    // Scoped tools can depend on an owner that is assigned after construction.
+    if (!this.toolDiscoveryRestored) {
+      this.toolDiscovery.restore(this.messages);
+      this.toolDiscoveryRestored = true;
+    }
+    return this.toolDiscovery.getVisibleTools();
   }
 
   getPermissionMode(): PermissionMode {
     return this.currentPermissionMode;
+  }
+
+  /** Set the active session mode from an explicit UI selection. */
+  selectSessionPermissionMode(mode: PermissionMode): void {
+    this.setPermissionMode(mode, false);
+  }
+
+  /** Switch the active model for this session after the caller validates a profile. */
+  selectSessionModel(model: string): void {
+    const handle = model.trim();
+    if (!handle) throw new Error("Model handle is required");
+    this.sessionModelOverride = handle;
+    resetAutoCompactFailures(this.autoCompactState);
   }
 
   /**
@@ -258,6 +301,7 @@ export class QueryEngine {
   clearContextAndImplement(planContent: string, allowedPrompts?: string[]): string {
     this.messages = [];
     this.invalidateUsageAnchor();
+    resetAutoCompactFailures(this.autoCompactState);
     if (allowedPrompts) {
       this.addSessionAllowRules(allowedPrompts);
     }
@@ -298,16 +342,26 @@ export class QueryEngine {
     return true;
   }
 
-  async *submitMessage(
+  selectSessionTeam(enabled: boolean, instructions: string): void {
+    this.toolContext.agentTeamsAllowed = enabled;
+    this.toolContext.sessionInstructions = instructions;
+  }
+
+  submitMessage(input: string): AsyncGenerator<QueryEngineEvent, { handled: boolean; reason?: LoopTerminationReason }> {
+    return inPlatformTask(this.toolContext.sessionId, this.submitMessageInTask(input));
+  }
+
+  private async *submitMessageInTask(
     input: string,
   ): AsyncGenerator<QueryEngineEvent, { handled: boolean; reason?: LoopTerminationReason }> {
+    await requirePlatformScope(0);
     const trimmed = input.trim();
     // Stage 20: empty input is a valid call when there are background-
     // agent notifications waiting — the auto-trigger path in
     // useAgentSession passes "" to mean "drain whatever's in the queue
     // and run a turn". `submitInternal` is already empty-text safe (it
     // skips the user-message append).
-    if (!trimmed && pendingNotificationCount() === 0) {
+    if (!trimmed && pendingNotificationCount(notificationScopeForContext(this.toolContext)) === 0) {
       return { handled: false };
     }
 
@@ -390,6 +444,10 @@ export class QueryEngine {
         yield { type: "command", kind: "error", message: "Agent Skills is closed. Use /agent-skill open to enable skills." };
         return { handled: true };
       }
+      if (!isBuiltinCommandName(skillName) && findSkill(skillName) && !isSkillEnabled(skillName)) {
+        yield { type: "command", kind: "error", message: `Skill '${skillName}' is closed. Use /agent-skill open ${skillName} to enable it.` };
+        return { handled: true };
+      }
       const skillExpansion = this.tryExpandSkillCommand(trimmed);
       if (skillExpansion) {
         const markerMessage: MessageParam = {
@@ -427,7 +485,7 @@ export class QueryEngine {
     const [, name, rawArgs] = match;
     if (isBuiltinCommandName(name) || !isAgentSkillsEnabled()) return null;
     const skill = findSkill(name);
-    if (!skill) return null;
+    if (!skill || !isSkillEnabled(name)) return null;
 
     const args = rawArgs?.trim() ?? "";
     const dir = skill.baseDir.split(/[\\/]/).join("/");
@@ -527,6 +585,7 @@ export class QueryEngine {
     trimmed: string,
     rawDirectUserText?: string,
   ): AsyncGenerator<QueryEngineEvent, { handled: boolean; reason?: LoopTerminationReason }> {
+    if (this.toolContext.abortSignal?.aborted) return { handled: true, reason: "aborted" };
 
     // ─── Stage 26: open the file-history snapshot for this turn ─────
     // Fire at turn start (before any edit) so the snapshot bound to this
@@ -601,172 +660,212 @@ export class QueryEngine {
       }
     }
 
-    const previewSystemParts = await buildSystemPrompt({
-      cwd: this.toolContext.cwd,
-      userQuery: promptToSubmit,
-    });
-    const previewSystemPrompt = renderSystemPrompt(previewSystemParts);
-    const activeContextWindow = await this.getActiveContextWindow();
-
-    // Only run compaction when there's meaningful conversation history
-    if (this.messages.length > 0) {
-      // Micro-compact old tool results first
-      const microResult = await compactMessages(this.messages, undefined, {
-        usage: this.lastCallUsage,
-        usageAnchorIndex: this.usageAnchorIndex,
-        systemPrompt: previewSystemPrompt,
-        model: this.getActiveModel(),
-        contextWindow: activeContextWindow,
-        microOnly: true,
-      });
-      if (microResult.didMicroCompact || microResult.didCompact) {
-        this.messages = [...microResult.messages];
-        this.invalidateUsageAnchor();
-        yield { type: "messages_updated", messages: [...this.messages] };
-        yield {
-          type: "compacted",
-          summary: microResult.summary,
-          trigger: microResult.didCompact ? "auto" : "micro",
-        };
-      }
-
-      // Auto-compact with circuit breaker if still over threshold
-      const { result: autoResult, didAutoCompact } = await autoCompactIfNeeded(
-        this.messages,
-        this.getActiveModel(),
-        {
-          usage: this.lastCallUsage,
-          usageAnchorIndex: this.usageAnchorIndex,
-          systemPrompt: previewSystemPrompt,
-          contextWindow: activeContextWindow,
-        },
-      );
-      if (didAutoCompact) {
-        this.messages = [...autoResult.messages];
-        this.invalidateUsageAnchor();
-        yield { type: "messages_updated", messages: [...this.messages] };
-        yield { type: "compacted", summary: autoResult.summary, trigger: "auto" };
-      }
-
-      // Emit token warning if approaching limits
-      const estimatedTokens = tokenCountWithEstimation(this.messages, {
-        usage: this.lastCallUsage,
-        usageAnchorIndex: this.usageAnchorIndex,
-        systemPrompt: previewSystemPrompt,
-      });
-      const warningState = calculateTokenWarningState(
-        estimatedTokens,
-        this.getActiveModel(),
-        activeContextWindow,
-      );
-      if (warningState.state !== "normal") {
-        yield { type: "token_warning", warning: warningState };
-      }
-    }
-
-    // Inject plan mode attachments as user messages (before user input)
-    if (this.currentPermissionMode === "plan") {
-      const planAttachment = getPlanModeAttachment(this.messages, getPlanFilePath());
-      if (planAttachment) {
-        this.messages = [...this.messages, planAttachment];
-      }
-    } else if (this.needsPlanModeExitAttachment) {
-      this.needsPlanModeExitAttachment = false;
-      const exists = await checkPlanExists();
-      const exitAttachment = getPlanModeExitAttachment(getPlanFilePath(), exists);
-      this.messages = [...this.messages, exitAttachment];
-    }
-
-    // Stage 20: drain any pending background-agent notifications BEFORE
-    // the user message. The model will see them as system-side user
-    // messages tagged `[task-notification]` so it can react ("oh the
-    // background reviewer finished — let me look at its output") before
-    // tackling the actual user prompt.
-    //
-    // Source reference: claude-code-source-code/src/utils/queueProcessor.ts
-    //   `processQueueIfReady` drains task-notification entries between
-    //   turns and calls `enqueueUserOrSystemMessage` to inject them.
-    const pendingNotifs = drainPendingNotifications();
-    for (const notif of pendingNotifs) {
-      const notifMessage: MessageParam = {
-        role: "user",
-        content: `[${notif.mode}]\n${notif.text}`,
-      };
-      this.messages = [...this.messages, notifMessage];
-    }
-    if (pendingNotifs.length > 0) {
-      yield { type: "messages_updated", messages: [...this.messages] };
-    }
-
-    // ─── Stage 34: ultrathink keyword ──────────────────────────────
-    // When the user prompt contains the whole-word keyword "ultrathink",
-    // inject a hidden meta user message asking the model for high reasoning
-    // effort. Mirrors source's ultrathink_effort branch: it does NOT change
-    // the thinking budget — it only nudges effort via a meta message. The
-    // marker prefix keeps it out of the human-visible transcript.
-    if (promptToSubmit.length > 0 && hasUltrathinkKeyword(promptToSubmit)) {
-      const ultrathinkMessage: MessageParam = {
-        role: "user",
-        content: `[ultrathink]\n${ULTRATHINK_META_MESSAGE}`,
-      };
-      this.messages = [...this.messages, ultrathinkMessage];
-    }
-
-    // Stage 20: when this turn was triggered by a background-agent
-    // notification (no real user input), skip appending an empty user
-    // message — the notification(s) we just drained ARE the user-side
-    // input for the model. The Anthropic API also rejects empty
-    // user-content blocks, so this guard is correctness, not just hygiene.
-    if (promptToSubmit.length > 0) {
-      // Attach any `@image.png` references as real image blocks so the model
-      // can see them. Falls back to a plain string when there are none.
-      const built = await buildUserMessageContent(promptToSubmit, this.toolContext.cwd);
-      // Image feedback is transient and must NOT seize the screen: emit it as a
-      // non-blocking notice (vs. a `command` panel, which pins above the input
-      // and hides it until Esc).
-      for (const err of built.errors) {
-        yield { type: "notice", tone: "error", title: "Image", body: err };
-      }
-      if (built.attached.length > 0) {
-        const names = built.attached.map((a) => a.ref).join(", ");
-        yield { type: "notice", tone: "info", title: "Image attached", body: names };
-        // Route a successfully attached image to the configured vision role
-        // for this turn only. Explicit `/model` or command-level overrides
-        // remain authoritative. The vision model extracts evidence; native
-        // tools and Jev still own validation and execution.
-        if (!this.sessionModelOverride && !this.turnModelOverride) {
-          const visionModel = await resolveModelRole(
-            ["image", "multimodal", "vision"],
-            this.toolContext.cwd,
-          );
-          if (visionModel) {
-            this.turnModelOverride = visionModel;
-            yield {
-              type: "notice",
-              tone: "info",
-              title: "Vision model",
-              body: `This image turn is routed to ${visionModel}.`,
-            };
-          }
-        }
-      }
-      const userMessage: MessageParam = {
-        role: "user",
-        content: built.content as MessageParam["content"],
-      };
-      this.messages = [...this.messages, userMessage];
-      yield { type: "messages_updated", messages: [...this.messages] };
-    }
-
+    if (this.toolContext.abortSignal?.aborted) return { handled: true, reason: "aborted" };
     const abortController = new AbortController();
     this.abortController = abortController;
-
+    const abortSignal = this.toolContext.abortSignal
+      ? AbortSignal.any([abortController.signal, this.toolContext.abortSignal])
+      : abortController.signal;
     try {
-      const systemParts = previewSystemParts;
+      const prepareImages = async (messages: MessageParam[], historical = false) => {
+        const prepared = await prepareOfficialImageReferences(messages, this.getActiveModel(), this.toolContext.cwd, abortSignal, undefined, !historical);
+        if (prepared.imageCount && !historical) {
+          const tools = this.getActiveTools();
+          if (!tools.some(tool => tool.name === "ReadImage")) throw new Error("当前工具范围未开放 ReadImage，无法使用官方读图辅助服务。");
+        }
+        return prepared.messages;
+      };
+      // Restored and failed turns may already contain pixels. Remove them before
+      // compaction, which also calls the current main model.
+      const preparedHistory = await prepareImages(this.messages, true);
+      if (preparedHistory !== this.messages) {
+        this.messages = preparedHistory;
+        this.invalidateUsageAnchor();
+        yield { type: "messages_updated", messages: [...this.messages] };
+      }
+      const environmentContext = await getRuntimeEnvironmentContext(this.toolContext.cwd);
+      const previewSystemParts = await buildSystemPrompt({
+        environmentContext,
+        runtimeStateInMessages: true,
+        cwd: this.toolContext.cwd,
+        userQuery: promptToSubmit,
+        temporaryChat: this.toolContext.temporaryChat,
+        additionalInstructions: this.toolContext.sessionInstructions,
+        agentTeamsAllowed: this.toolContext.agentTeamsAllowed,
+        applicationProtection: this.toolContext.applicationProtection,
+      });
+      const previewSystemPrompt = renderSystemPrompt(previewSystemParts);
+      const activeContextWindow = await this.getActiveContextWindow();
+      const previewTools = this.getModelTools();
+      let initialCompactionFailed = false;
+      let pendingAutoCompaction: Extract<QueryEngineEvent, { type: "compacted" }> | undefined;
+      if (this.toolContext.abortSignal?.aborted) return { handled: true, reason: "aborted" };
+
+      // Only run compaction when there's meaningful conversation history
+      if (this.messages.length > 0) {
+        // Micro-compact old tool results first
+        const microResult = await compactMessages(this.messages, undefined, {
+          ...this.usageEstimate(),
+          systemPrompt: previewSystemPrompt,
+          toolDefinitions: previewTools,
+          model: this.getActiveModel(),
+          contextWindow: activeContextWindow,
+          microOnly: true,
+          signal: abortSignal,
+        });
+        if (microResult.didMicroCompact || microResult.didCompact) {
+          this.messages = [...microResult.messages];
+          this.invalidateUsageAnchor();
+          yield { type: "messages_updated", messages: [...this.messages] };
+          yield {
+            type: "compacted",
+            summary: microResult.summary,
+            trigger: microResult.didCompact ? "auto" : "micro",
+          };
+        }
+
+        // Auto-compact with circuit breaker if still over threshold
+        const { result: autoResult, didAutoCompact, didAttemptAutoCompact } = await autoCompactIfNeeded(
+          this.messages,
+          this.getActiveModel(),
+          {
+            ...this.usageEstimate(),
+            systemPrompt: previewSystemPrompt,
+            toolDefinitions: previewTools,
+            contextWindow: activeContextWindow,
+            signal: abortSignal,
+            state: this.autoCompactState,
+          },
+        );
+        initialCompactionFailed = didAttemptAutoCompact && !didAutoCompact;
+        if (didAutoCompact) {
+          this.messages = [...autoResult.messages];
+          this.invalidateUsageAnchor();
+          yield { type: "messages_updated", messages: [...this.messages] };
+          // CLI/Web persist the raw current prompt before entering the engine.
+          // Do not publish their replacement checkpoint until that prompt and
+          // its prepared attachments are also present in the compacted state.
+          pendingAutoCompaction = { type: "compacted", summary: autoResult.summary, trigger: "auto" };
+        }
+
+        // Emit token warning if approaching limits
+        const estimatedTokens = tokenCountWithEstimation(this.messages, {
+          ...this.usageEstimate(),
+          systemPrompt: previewSystemPrompt,
+          toolDefinitions: previewTools,
+        });
+        const warningState = calculateTokenWarningState(
+          estimatedTokens,
+          this.getActiveModel(),
+          activeContextWindow,
+        );
+        if (warningState.state !== "normal") {
+          yield { type: "token_warning", warning: warningState };
+        }
+      }
+
+      const withRuntimeContext = appendRuntimeContext(this.messages, environmentContext);
+      if (withRuntimeContext !== this.messages) {
+        this.messages = withRuntimeContext;
+        yield { type: "messages_updated", messages: [...this.messages] };
+      }
+
+      // Inject plan mode attachments as user messages (before user input)
+      if (this.currentPermissionMode === "plan") {
+        const planAttachment = getPlanModeAttachment(this.messages, getPlanFilePath());
+        if (planAttachment) {
+          this.messages = [...this.messages, planAttachment];
+        }
+      } else if (this.needsPlanModeExitAttachment) {
+        this.needsPlanModeExitAttachment = false;
+        const exists = await checkPlanExists();
+        const exitAttachment = getPlanModeExitAttachment(getPlanFilePath(), exists);
+        this.messages = [...this.messages, exitAttachment];
+      }
+
+      // Stage 20: drain any pending background-agent notifications BEFORE
+      // the user message. The model will see them as system-side user
+      // messages tagged `[task-notification]` so it can react ("oh the
+      // background reviewer finished — let me look at its output") before
+      // tackling the actual user prompt.
+      //
+      // Source reference: claude-code-source-code/src/utils/queueProcessor.ts
+      //   `processQueueIfReady` drains task-notification entries between
+      //   turns and calls `enqueueUserOrSystemMessage` to inject them.
+      const pendingNotifs = drainPendingNotifications(notificationScopeForContext(this.toolContext));
+      for (const notif of pendingNotifs) {
+        const notifMessage: MessageParam = {
+          role: "user",
+          content: `[${notif.mode}]\n${notif.text}`,
+        };
+        this.messages = [...this.messages, notifMessage];
+      }
+      if (pendingNotifs.length > 0) {
+        yield { type: "messages_updated", messages: [...this.messages] };
+      }
+
+      // ─── Stage 34: ultrathink keyword ──────────────────────────────
+      // When the user prompt contains the whole-word keyword "ultrathink",
+      // inject a hidden meta user message asking the model for high reasoning
+      // effort. Mirrors source's ultrathink_effort branch: it does NOT change
+      // the thinking budget — it only nudges effort via a meta message. The
+      // marker prefix keeps it out of the human-visible transcript.
+      if (promptToSubmit.length > 0 && hasUltrathinkKeyword(promptToSubmit)) {
+        const ultrathinkMessage: MessageParam = {
+          role: "user",
+          content: `[ultrathink]\n${ULTRATHINK_META_MESSAGE}`,
+        };
+        this.messages = [...this.messages, ultrathinkMessage];
+      }
+
+      // Stage 20: when this turn was triggered by a background-agent
+      // notification (no real user input), skip appending an empty user
+      // message — the notification(s) we just drained ARE the user-side
+      // input for the model. The Anthropic API also rejects empty
+      // user-content blocks, so this guard is correctness, not just hygiene.
+      if (promptToSubmit.length > 0) {
+        // Attach any `@image.png` references as real image blocks so the model
+        // can see them. Falls back to a plain string when there are none.
+        const built = await buildUserMessageContent(promptToSubmit, this.toolContext.cwd);
+        // Image feedback is transient and must NOT seize the screen: emit it as a
+        // non-blocking notice (vs. a `command` panel, which pins above the input
+        // and hides it until Esc).
+        for (const err of built.errors) {
+          yield { type: "notice", tone: "error", title: "Image", body: err };
+        }
+        if (built.attached.length > 0) {
+          const images = built.attached.filter((a) => a.kind !== "audio");
+          const audio = built.attached.filter((a) => a.kind === "audio");
+          if (images.length) yield { type: "notice", tone: "info", title: "Image attached", body: images.map((a) => a.ref).join(", ") };
+          if (audio.length) yield { type: "notice", tone: "info", title: "Audio attached", body: audio.map((a) => a.ref).join(", ") };
+        }
+        const userMessage: MessageParam = {
+          role: "user",
+          content: built.content as MessageParam["content"],
+        };
+        this.messages = [...this.messages, userMessage];
+        yield { type: "messages_updated", messages: [...this.messages] };
+      }
+
+      const preparedMessages = await prepareImages(this.messages);
+      if (preparedMessages !== this.messages) {
+        this.messages = preparedMessages;
+        this.invalidateUsageAnchor();
+        yield { type: "messages_updated", messages: [...this.messages] };
+      }
+      abortSignal.throwIfAborted();
+      const configuration = this.getActiveModel().startsWith("ccagent:") ? await readServiceConfiguration() : null;
+      const officialRoute = configuration?.routes.find(route => "ccagent:" + route.id === this.getActiveModel());
+      const activeProfile = officialRoute?.upstreamModel ? undefined
+        : await resolveProfile(this.getActiveModel(), this.toolContext.cwd).catch(() => undefined);
+      const conversationMainModel = officialRoute?.upstreamModel || activeProfile?.officialUpstreamModel || activeProfile?.model;
+      const systemParts = [...previewSystemParts, formatMainModelIdentity(conversationMainModel)];
       const systemPrompt = renderSystemPrompt(systemParts);
       const enrichedToolContext: ToolContext = {
         ...this.toolContext,
-        abortSignal: abortController.signal,
+        abortSignal,
+        officialVisionOnly: officialRoute?.limits.maxImages === 0,
+        conversationMainModel,
         setPermissionMode: (mode: string) => this.setPermissionMode(mode as PermissionMode),
         getPermissionMode: () => this.currentPermissionMode,
         addSessionAllowRules: (rules: string[]) => this.addSessionAllowRules(rules),
@@ -783,19 +882,33 @@ export class QueryEngine {
         messageId: this.currentMessageId ?? undefined,
       };
 
+      if (pendingAutoCompaction) {
+        abortSignal.throwIfAborted();
+        yield pendingAutoCompaction;
+      }
+
       const loop = query({
         messages: [...this.messages],
+        initialCallUsage: this.usageEstimate().usage,
+        initialUsageAnchorIndex: this.usageAnchorIndex,
+        initialSystemPromptTokens: this.lastCallSystemPromptTokens,
+        initialToolDefinitionTokens: this.lastCallToolDefinitionTokens,
+        initialCompactionFailed,
+        prepareMessages: prepareImages,
         ...(rawDirectUserText ? { directUserTurnText: rawDirectUserText } : {}),
         systemPrompt,
-        getTools: () => getToolsApiParams(this.currentPermissionMode),
+        runtimeContext: environmentContext,
+        toolDiscovery: this.toolDiscovery,
+        getTools: () => this.getActiveTools(),
         model: this.getActiveModel(),
         contextWindow: activeContextWindow,
-        abortSignal: abortController.signal,
+        abortSignal,
         toolContext: enrichedToolContext,
         permissionMode: this.currentPermissionMode,
         permissionSettings: this.permissionSettings,
         sessionPermissionRules: this.sessionPermissionRules,
         onPermissionRequest: this.onPermissionRequest,
+        ...(this.maxTurns === undefined ? {} : { maxTurns: this.maxTurns }),
       });
 
       while (true) {
@@ -811,7 +924,10 @@ export class QueryEngine {
               (this.totalUsage.cache_read_input_tokens ?? 0) + (value.usage.cache_read_input_tokens ?? 0),
           };
           this.lastCallUsage = { ...value.lastCallUsage };
-          this.usageAnchorIndex = this.messages.length > 0 ? this.messages.length - 1 : -1;
+          this.usageAnchorIndex = value.lastCallUsageAnchorIndex;
+          this.lastCallSystemPromptTokens = value.lastCallSystemPromptTokens;
+          this.lastCallToolDefinitionTokens = value.lastCallToolDefinitionTokens;
+          this.lastCallModel = this.getActiveModel();
           yield { type: "messages_updated", messages: [...this.messages] };
           yield {
             type: "usage_updated",
@@ -837,6 +953,10 @@ export class QueryEngine {
         yield value;
 
         switch (value.type) {
+          case "messages_updated":
+            this.messages = [...value.messages];
+            this.invalidateUsageAnchor();
+            break;
           case "assistant_message":
           case "tool_result_message":
             this.messages = [...this.messages, value.message];
@@ -846,6 +966,10 @@ export class QueryEngine {
             break;
         }
       }
+    } catch (error) {
+      if (abortSignal.aborted) return { handled: true, reason: "aborted" };
+      yield { type: "error", error: error instanceof Error ? error : new Error(String(error)) };
+      return { handled: true, reason: "model_error" };
     } finally {
       this.abortController = null;
       // Stage 23: drop any per-turn model override so the next prompt
@@ -857,6 +981,27 @@ export class QueryEngine {
   private invalidateUsageAnchor(): void {
     this.usageAnchorIndex = -1;
     this.lastCallUsage = { input_tokens: 0, output_tokens: 0 };
+    this.lastCallSystemPromptTokens = undefined;
+    this.lastCallToolDefinitionTokens = undefined;
+    this.lastCallModel = undefined;
+  }
+
+  private usageEstimate() {
+    return {
+      // Usage from another model cannot establish this model's context size.
+      usage: this.lastCallModel === this.getActiveModel() ? this.lastCallUsage : undefined,
+      usageAnchorIndex: this.usageAnchorIndex,
+      usageSystemPromptTokens: this.lastCallSystemPromptTokens,
+      usageToolDefinitionTokens: this.lastCallToolDefinitionTokens,
+    };
+  }
+
+  private getActiveTools() {
+    return (this.toolContext.scopedTools === undefined
+      ? getToolsApiParams(this.currentPermissionMode)
+      : this.toolContext.scopedTools.filter((tool, index, scoped) => tool.isEnabled() && scoped.findIndex(candidate => candidate.name === tool.name) === index
+        && scoped.filter(candidate => candidate.name === tool.name).length === 1).map(toolToApiParam))
+      .filter(tool => this.toolContext.agentTeamsAllowed !== false || !["TeamCreate", "TeamDelete", "SendMessage", "AgentTeamMode"].includes(tool.name));
   }
 
   private async getActiveContextWindow(): Promise<number> {
@@ -885,6 +1030,7 @@ export class QueryEngine {
   private commandContext(): CommandContext {
     return {
       cwd: this.toolContext.cwd,
+      applicationProtection: this.toolContext.applicationProtection,
       sessionId: this.toolContext.sessionId,
       defaultModel: this.defaultModel,
       getMessages: () => this.messages,
@@ -893,11 +1039,13 @@ export class QueryEngine {
       getModelSource: () => this.getModelSource(),
       getPermissionMode: () => this.currentPermissionMode,
       getPrePlanMode: () => this.prePlanMode,
+      getModelTools: () => this.getModelTools(),
       applyRestoredSession: (messages, totalUsage) => {
         this.messages = [...messages];
+        this.toolDiscovery.reset(this.messages);
         this.totalUsage = { ...totalUsage };
-        this.usageAnchorIndex = this.messages.length > 0 ? this.messages.length - 1 : -1;
-        this.lastCallUsage = { input_tokens: 0, output_tokens: 0 };
+        this.invalidateUsageAnchor();
+        resetAutoCompactFailures(this.autoCompactState);
         this.currentMessageId = null;
         // A resumed session is a fresh boot for the SessionStart hook semantics.
         this.sessionStartHooksFired = false;
@@ -908,7 +1056,7 @@ export class QueryEngine {
     };
   }
 
-  private async *handleCommand(command: string): AsyncGenerator<QueryEngineEvent, { handled: boolean }> {
+  private async *handleCommand(command: string): AsyncGenerator<QueryEngineEvent, { handled: boolean; reason?: LoopTerminationReason }> {
     const [name, ...args] = command.slice(1).split(/\s+/).filter(Boolean);
 
     switch (name) {
@@ -1032,6 +1180,9 @@ export class QueryEngine {
       }
       case "clear":
         this.messages = [];
+        this.toolDiscovery.reset();
+        this.invalidateUsageAnchor();
+        resetAutoCompactFailures(this.autoCompactState);
         yield { type: "session_cleared" };
         yield { type: "messages_updated", messages: [] };
         yield { type: "command", kind: "info", message: "Conversation cleared." };
@@ -1048,6 +1199,51 @@ export class QueryEngine {
         const { loadProfiles } = await import("../services/api/providers/profile.js");
 
         const emptyProfiles: Record<string, ModelProfile> = {};
+        const { defaultModel: savedDefault } = await loadProfiles(this.toolContext.cwd);
+        if (savedDefault && savedDefault !== this.defaultModel) {
+          const active = this.getActiveModel();
+          this.defaultModel = savedDefault;
+          if (!this.sessionModelOverride && active !== savedDefault) this.sessionModelOverride = active;
+        }
+
+        if (args[0] === "save") {
+          if (args.length > 2) {
+            yield { type: "command", kind: "error", message: "Usage: /model save [<name|profile>]" };
+            return { handled: true };
+          }
+          try {
+            const saved = await saveDefaultModel(args[1] || this.getActiveModel(), this.toolContext.cwd);
+            this.defaultModel = saved.effectiveDefault;
+            this.sessionModelOverride = saved.handle === saved.effectiveDefault ? null : saved.handle;
+            this.turnModelOverride = null;
+            yield { type: "model_changed", model: saved.handle, source: this.getModelSource() };
+            yield { type: "command", kind: "info", message: [
+              `已保存默认模型：${saved.handle} · ${saved.profile.model}，当前会话立即生效。`,
+              `保存位置：${saved.path}（defaultModel）`,
+              saved.effectiveDefault === saved.handle ? "后续启动默认使用此模型；显式 --model 参数仍可覆盖。"
+                : `用户默认已保存；当前项目或管理设置的有效默认仍为 ${saved.effectiveDefault}。`,
+            ].join("\n") };
+          } catch (error) {
+            yield { type: "command", kind: "error", message: `保存默认模型失败：${error instanceof Error ? error.message : String(error)}` };
+          }
+          return { handled: true };
+        }
+
+        if (!nextModel && this.toolContext.requestUserQuestion) {
+          const cursor = { page: 0 };
+          try {
+            for (;;) {
+              const { profiles } = await loadProfiles(this.toolContext.cwd);
+              const selected = await chooseModel(this.toolContext.requestUserQuestion, Object.values(profiles), this.getActiveModel(), this.defaultModel, cursor);
+              if (!selected) break;
+              yield* this.handleCommand(`/model ${selected.save ? "save " : ""}${selected.handle}`);
+            }
+            yield { type: "command", kind: "info", message: `模型选择已完成，当前模型：${this.getActiveModel()}` };
+          } catch (error) {
+            yield { type: "command", kind: "error", message: `模型选择失败：${error instanceof Error ? error.message : String(error)}` };
+          }
+          return { handled: true };
+        }
 
         if (!nextModel) {
           const { profiles } = await loadProfiles(this.toolContext.cwd).catch(() => ({ profiles: emptyProfiles }));
@@ -1063,6 +1259,7 @@ export class QueryEngine {
               this.sessionModelOverride ? `- Session override: ${this.sessionModelOverride}` : "- Session override: none",
               ids.length ? `- Declared profiles: ${ids.join(", ")}` : "- Declared profiles: none (set them in settings.json `models`)",
               "- Usage: /model <name|profile> to override for this session",
+              "- Usage: /model save [name|profile] to save a persistent user default",
               "- Usage: /model list to see profiles, /model default to clear the override",
             ].join("\n"),
           };
@@ -1080,18 +1277,19 @@ export class QueryEngine {
           } else {
             for (const id of ids) {
               const p = profiles[id]!;
-              const marker = id === this.getActiveModel() ? " (active)" : defaultModel === id ? " (default)" : "";
+              const marker = (id === this.getActiveModel() ? " (active)" : "") + (defaultModel === id ? " (default)" : "");
               lines.push(`  ${id}${marker} · ${p.protocol} · ${p.model}${p.baseURL ? ` · ${p.baseURL}` : ""}`);
             }
           }
           for (const w of warnings) lines.push(`  ⚠ ${w}`);
-          lines.push("", "Switch with /model <id>; clear with /model default.");
+          lines.push("", "Switch with /model <id>; save with /model save [id]; clear with /model default.");
           yield { type: "command", kind: "info", message: lines.join("\n") };
           return { handled: true };
         }
 
         if (nextModel === "default") {
           this.sessionModelOverride = null;
+          resetAutoCompactFailures(this.autoCompactState);
           const activeModel = this.getActiveModel();
           yield { type: "model_changed", model: activeModel, source: "default" };
           yield {
@@ -1110,15 +1308,23 @@ export class QueryEngine {
         // Annotate the switch with the resolved protocol when it matches a
         // declared profile (helps the user confirm they hit the right one).
         const { profiles } = await loadProfiles(this.toolContext.cwd).catch(() => ({ profiles: emptyProfiles }));
-        const matched = profiles[nextModel];
-        this.sessionModelOverride = nextModel;
-        yield { type: "model_changed", model: nextModel, source: "session" };
+        let resolved: ModelProfile;
+        try {
+          resolved = await resolveProfile(nextModel, this.toolContext.cwd);
+        } catch (error) {
+          yield { type: "command", kind: "error", message: error instanceof Error ? error.message : String(error) };
+          return { handled: true };
+        }
+        const matched = profiles[resolved.id];
+        const handle = matched?.id ?? nextModel;
+        this.selectSessionModel(handle);
+        yield { type: "model_changed", model: handle, source: "session" };
         yield {
           type: "command",
           kind: "info",
           message: [
             "Model updated",
-            `- Active model: ${nextModel}`,
+            `- Active model: ${handle}`,
             matched ? `- Protocol: ${matched.protocol} · upstream model: ${matched.model}` : "- Protocol: anthropic (raw model name)",
             "- Source: session",
             `- Default model remains: ${this.defaultModel}`,
@@ -1134,21 +1340,32 @@ export class QueryEngine {
         };
         return { handled: true };
       case "compact": {
-        const focus = args.join(" ").trim();
-        const manualSystemParts = await buildSystemPrompt({ cwd: this.toolContext.cwd });
-        const manualSystemPrompt = renderSystemPrompt(manualSystemParts);
-        const result = await compactMessages(this.messages, focus || undefined, { usage: this.lastCallUsage, usageAnchorIndex: this.usageAnchorIndex, systemPrompt: manualSystemPrompt, model: this.getActiveModel(), contextWindow: await this.getActiveContextWindow(), force: true });
-        this.messages = [...result.messages];
-        if (result.didCompact || result.didMicroCompact) {
-          this.invalidateUsageAnchor();
+        const controller = new AbortController();
+        this.abortController = controller;
+        const signal = this.toolContext.abortSignal ? AbortSignal.any([controller.signal, this.toolContext.abortSignal]) : controller.signal;
+        try {
+          const focus = args.join(" ").trim();
+          const manualSystemParts = await buildSystemPrompt({ cwd: this.toolContext.cwd, temporaryChat: this.toolContext.temporaryChat, applicationProtection: this.toolContext.applicationProtection });
+          const manualSystemPrompt = renderSystemPrompt(manualSystemParts);
+          const result = await compactMessages(this.messages, focus || undefined, { ...this.usageEstimate(), systemPrompt: manualSystemPrompt, toolDefinitions: this.getModelTools(), model: this.getActiveModel(), contextWindow: await this.getActiveContextWindow(), force: true, signal });
+          this.messages = [...result.messages];
+          if (result.didCompact || result.didMicroCompact) {
+            this.invalidateUsageAnchor();
+            resetAutoCompactFailures(this.autoCompactState);
+          }
+          yield { type: "messages_updated", messages: [...this.messages] };
+          if (result.didCompact || result.didMicroCompact) {
+            yield { type: "compacted", summary: result.summary, trigger: focus ? "manual" : result.didCompact ? "manual" : "micro" };
+          } else {
+            yield { type: "command", kind: "info", message: "Conversation did not need compaction." };
+          }
+          return { handled: true };
+        } catch (error) {
+          if (signal.aborted) return { handled: true, reason: "aborted" };
+          throw error;
+        } finally {
+          if (this.abortController === controller) this.abortController = null;
         }
-        yield { type: "messages_updated", messages: [...this.messages] };
-        if (result.didCompact || result.didMicroCompact) {
-          yield { type: "compacted", summary: result.summary, trigger: focus ? "manual" : result.didCompact ? "manual" : "micro" };
-        } else {
-          yield { type: "command", kind: "info", message: "Conversation did not need compaction." };
-        }
-        return { handled: true };
       }
       case "rewind":
       case "checkpoint":
@@ -1277,6 +1494,7 @@ export class QueryEngine {
    * in ./queryEngine/commands/permissions.ts.
    */
   async getPermissionsView(): Promise<PermissionsViewData> {
+    await requirePlatformScope();
     return buildPermissionsView(this.commandContext());
   }
 
@@ -1290,6 +1508,7 @@ export class QueryEngine {
     rule: string,
     scope: SettingSource,
   ): Promise<PermissionsViewData> {
+    await requirePlatformScope(0);
     return mutatePermissionRuleImpl(this.commandContext(), op, rule, scope);
   }
 
@@ -1298,16 +1517,19 @@ export class QueryEngine {
    * registries, and return the refreshed view so the overlay stays in sync.
    */
   async mutatePlugin(action: PluginMutation): Promise<PluginViewData> {
+    await requirePlatformScope(0);
     return mutatePluginImpl(this.commandContext(), action);
   }
 
   /** Validate and describe a plugin package without changing any state. */
   async previewPlugin(pluginId: string): Promise<PluginInstallPreview> {
+    await requirePlatformScope();
     return previewPluginImpl(pluginId);
   }
 
   /** Rebuild the `/plugin` manager snapshot without changing anything. */
   async refreshPluginView(): Promise<PluginViewData> {
+    await requirePlatformScope();
     return buildPluginView(this.commandContext().cwd);
   }
 

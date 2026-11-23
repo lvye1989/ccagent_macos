@@ -35,6 +35,10 @@ import {
   loadTrustedSettingSources,
   isTrustedScopeForSensitiveKeys,
 } from "../../../config/sources.js";
+import { environmentModelProfiles, getQwenOmniModel, splitModelNames, DEFAULT_QWEN_OMNI_MODEL } from "./modelConfig.js";
+import { officialModelPrefix, readServiceBinding } from "../../../platform/serviceState.js";
+import { getPlatformAccountClient } from "../../../platform/account.js";
+import { normalizeOllamaBaseURL } from "../../ollama.js";
 
 export type ModelProtocol =
   | "anthropic"
@@ -43,6 +47,14 @@ export type ModelProtocol =
   | "gemini";
 
 export interface ModelProfile {
+  /** Supplier identity from the authenticated official catalog; not project metadata. */
+  upstreamProvider?: string;
+  /** Dedicated local Ollama preset, transported through the shared OpenAI adapter. */
+  provider?: "ollama";
+  /** Only synthesized from the authenticated account's official catalog. Never read from project settings. */
+  platformService?: string;
+  /** Authenticated catalog metadata; never used to replace the gateway route id. */
+  officialUpstreamModel?: string;
   /** The map key / user-facing handle. */
   id: string;
   protocol: ModelProtocol;
@@ -56,17 +68,22 @@ export interface ModelProfile {
   maxTokens?: number;
   /** Provider context-window size used by warnings and auto-compaction. */
   contextWindow?: number;
+  /** Override automatic image-input capability detection for custom deployments. */
+  supportsVision?: boolean;
   /** Extra HTTP headers merged into the upstream request. */
   headers?: Record<string, string>;
 }
 
 interface RawProfile {
+  provider?: unknown;
+  disabled?: unknown;
   protocol?: unknown;
   model?: unknown;
   baseURL?: unknown;
   apiKey?: unknown;
   maxTokens?: unknown;
   contextWindow?: unknown;
+  supportsVision?: unknown;
   headers?: unknown;
 }
 
@@ -101,6 +118,7 @@ function usesEnvInterpolation(value: string): boolean {
 }
 
 export interface LoadedProfiles {
+  disabledProfiles?: string[];
   profiles: Record<string, ModelProfile>;
   defaultModel?: string;
   /** Non-fatal notices (dropped inline secrets, malformed entries). */
@@ -133,7 +151,8 @@ export async function resolveModelRole(
   const roles = await loadModelRoles(cwd);
   const handle = roleNames.map((name) => roles[name]).find(Boolean);
   if (!handle) return undefined;
-  const { profiles } = await loadProfiles(cwd);
+  const { profiles, disabledProfiles } = await loadProfiles(cwd);
+  if (disabledProfiles?.includes(handle)) throw new Error("该角色关联的导入模型尚未启用，请先在设置中补全配置并保存。");
   return profiles[handle] ? handle : undefined;
 }
 
@@ -146,7 +165,7 @@ export async function loadProfiles(cwd: string = process.cwd()): Promise<LoadedP
   // Filtering only literal API keys still lets an untrusted repo override a
   // user's endpoint while inheriting their real key, or interpolate it into headers.
   const sources = await loadTrustedSettingSources(cwd);
-  const merged: Record<string, RawProfile> = {};
+  const merged: Record<string, RawProfile> = environmentModelProfiles();
   const warnings: string[] = [];
   let defaultModel: string | undefined;
 
@@ -183,12 +202,38 @@ export async function loadProfiles(cwd: string = process.cwd()): Promise<LoadedP
   }
 
   const profiles: Record<string, ModelProfile> = {};
+  const variants: ModelProfile[] = [];
   for (const [id, raw] of Object.entries(merged)) {
+    // Old init profiles used QWEN_MODEL for screenshots. Honor the dedicated
+    // Omni variable even before the user re-runs init to migrate settings.
+    if (id === "qwen-omni" && typeof raw.model === "string" && /\$\{QWEN_MODEL(?::-[^}]*)?\}/.test(raw.model)) {
+      raw.model = getQwenOmniModel() || DEFAULT_QWEN_OMNI_MODEL;
+    }
+    if (raw.disabled === true) { warnings.push(`models.${id}: disabled; complete the imported configuration in Settings`); continue; }
+    if (id.startsWith(officialModelPrefix)) { warnings.push("CCAGENT 官方模型编号不能由项目或自定义配置覆盖。"); continue; }
     const built = buildProfile(id, raw, warnings);
-    if (built) profiles[id] = built;
+    if (built) {
+      profiles[id] = built;
+      const names = typeof raw.model === "string" ? splitModelNames(interpolateEnv(raw.model)) : [];
+      for (const model of names.slice(1)) variants.push({ ...built, id: model, model });
+    }
   }
+  // Explicit profile IDs always win over generated list entries.
+  for (const variant of variants) if (!profiles[variant.id]) profiles[variant.id] = variant;
 
-  return { profiles, defaultModel, warnings };
+  if (process.env.CCAGENT_ACCOUNT_ID) {
+    try {
+      const binding = await readServiceBinding();
+      if (binding && binding.configuration.origin !== (await getPlatformAccountClient()).origin) throw new Error("Official service origin changed");
+      for (const route of binding?.configuration.routes ?? []) {
+        if (!["chat", "vision"].includes(route.service) || !["openai-chat", "openai-responses"].includes(route.protocol)) continue;
+        const id = officialModelPrefix + route.id;
+        profiles[id] = { id, platformService: route.id, upstreamProvider: route.provider, officialUpstreamModel: route.upstreamModel, protocol: route.protocol as ModelProtocol, model: route.id,
+          baseURL: binding!.configuration.origin + "/v1", maxTokens: route.limits.maxOutputTokens, contextWindow: route.limits.contextWindow };
+      }
+    } catch { warnings.push("官方服务配置需要重新验证；不会切换到其他供应商密钥。"); }
+  }
+  return { profiles, defaultModel, warnings, disabledProfiles: Object.entries(merged).filter(([, raw]) => raw.disabled === true).map(([id]) => id) };
 }
 
 function buildProfile(
@@ -198,7 +243,7 @@ function buildProfile(
 ): ModelProfile | null {
   const protocol =
     typeof raw.protocol === "string" ? interpolateEnv(raw.protocol.trim()).trim() : "";
-  const model = typeof raw.model === "string" ? interpolateEnv(raw.model.trim()).trim() : "";
+  const model = typeof raw.model === "string" ? splitModelNames(interpolateEnv(raw.model))[0] ?? "" : "";
 
   if (!VALID_PROTOCOLS.has(protocol)) {
     warnings.push(
@@ -212,11 +257,20 @@ function buildProfile(
   }
 
   const profile: ModelProfile = { id, protocol: protocol as ModelProtocol, model };
+  if (typeof raw.supportsVision === "boolean") profile.supportsVision = raw.supportsVision;
 
-  if (typeof raw.baseURL === "string" && raw.baseURL.trim()) {
+  const ollama = raw.provider === "ollama";
+  if (ollama) {
+    if (protocol !== "openai-chat") { warnings.push(`models.${id}: Ollama requires openai-chat — ignored`); return null; }
+    try { profile.baseURL = normalizeOllamaBaseURL(typeof raw.baseURL === "string" ? interpolateEnv(raw.baseURL.trim()) : undefined); }
+    catch { warnings.push(`models.${id}: invalid Ollama service address — ignored`); return null; }
+    profile.provider = "ollama";
+  }
+
+  if (!ollama && typeof raw.baseURL === "string" && raw.baseURL.trim()) {
     profile.baseURL = interpolateEnv(raw.baseURL.trim());
   }
-  if (typeof raw.apiKey === "string" && raw.apiKey.trim()) {
+  if (!ollama && typeof raw.apiKey === "string" && raw.apiKey.trim()) {
     const key = interpolateEnv(raw.apiKey.trim());
     if (key) profile.apiKey = key;
   }
@@ -230,7 +284,7 @@ function buildProfile(
   ) {
     profile.contextWindow = Math.floor(raw.contextWindow);
   }
-  if (raw.headers && typeof raw.headers === "object" && !Array.isArray(raw.headers)) {
+  if (!ollama && raw.headers && typeof raw.headers === "object" && !Array.isArray(raw.headers)) {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(raw.headers as Record<string, unknown>)) {
       if (typeof v === "string") out[k] = interpolateEnv(v);
@@ -252,8 +306,15 @@ export async function resolveProfile(
   handle: string,
   cwd: string = process.cwd(),
 ): Promise<ModelProfile> {
-  const { profiles } = await loadProfiles(cwd);
+  const { profiles, disabledProfiles } = await loadProfiles(cwd);
   const declared = profiles[handle];
   if (declared) return declared;
+  const matches = Object.values(profiles).filter((profile) => profile.model === handle);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    throw new Error(`Model '${handle}' matches multiple profiles (${matches.map((p) => p.id).join(", ")}); choose a profile ID.`);
+  }
+  if (disabledProfiles?.includes(handle)) throw new Error("该导入模型尚未启用，请先在设置中补全配置并保存。");
+  if (handle.startsWith(officialModelPrefix)) throw new Error("官方模型不可用，请验证平台 Key 并刷新服务目录。");
   return { id: handle, protocol: "anthropic", model: handle };
 }

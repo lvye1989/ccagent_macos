@@ -12,6 +12,7 @@ import {
 } from "./AssistantThinkingMessage.js";
 import { AssistantMessageRow } from "./AssistantMessageRow.js";
 import { theme, glyph } from "../theme.js";
+import { isRuntimeContextMessage } from "../../context/runtimeContext.js";
 
 // Re-exported for back-compat: ToolResultInfo now lives (React-free) in
 // toolCardFormat so the renderer registry and the string transcript can share
@@ -56,6 +57,7 @@ interface ConversationViewProps {
 
 export function isInternalMessage(message: MessageParam): boolean {
   const content = typeof message.content === "string" ? message.content : "";
+  if (isRuntimeContextMessage(message)) return true;
   if (content.startsWith("[CompactBoundary]")) return true;
   if (content.startsWith("This session is being continued from a previous conversation")) return true;
   if (content.startsWith("[plan_mode_attachment]")) return true;
@@ -387,8 +389,9 @@ export function flattenConversation(
             .map((b) => b.text as string)
             .join("");
           const imageCount = blocks.filter((b) => b?.type === "image").length;
-          if (text || imageCount > 0) {
-            const suffix = imageCount > 0 ? `  [图片 ×${imageCount}]` : "";
+          const audioCount = blocks.filter((b) => b?.type === "audio").length;
+          if (text || imageCount > 0 || audioCount > 0) {
+            const suffix = (imageCount > 0 ? `  [图片 ×${imageCount}]` : "") + (audioCount > 0 ? `  [音频 ×${audioCount}]` : "");
             items.push({
               key: `u${index}`,
               element: (

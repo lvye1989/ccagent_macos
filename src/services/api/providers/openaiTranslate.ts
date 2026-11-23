@@ -15,7 +15,7 @@
  */
 
 import type { UniversalBody } from "llm-bridge";
-import { resultToString } from "./translateShared.js";
+import { resultToString, toolResultImages } from "./translateShared.js";
 
 /** Build a data: URL (or pass an http URL through) from universal media. */
 function mediaToImageUrl(media: { url?: string; data?: string; mimeType?: string } | undefined): string | null {
@@ -45,22 +45,26 @@ interface OpenAIChatMessage {
   content: string | null | OpenAIChatContentPart[];
   tool_call_id?: string;
   tool_calls?: OpenAIChatToolCall[];
+  reasoning_content?: string;
 }
 
 /** Build OpenAI Chat Completions `messages[]` from the universal IR. */
-export function universalToOpenAIChatMessages(universal: UniversalBody): OpenAIChatMessage[] {
+export function universalToOpenAIChatMessages(universal: UniversalBody, preserveThinking = false): OpenAIChatMessage[] {
   const out: OpenAIChatMessage[] = [];
   const sys = systemText(universal.system);
   if (sys) out.push({ role: "system", content: sys });
 
   for (const msg of universal.messages) {
     let text = "";
+    let thinking = "";
     const imageUrls: string[] = [];
     const toolCalls: OpenAIChatToolCall[] = [];
     const toolResults: Array<{ id: string; content: string }> = [];
     for (const part of msg.content ?? []) {
       if (part.type === "text" && typeof part.text === "string") {
         text += part.text;
+      } else if (preserveThinking && part.type === "thinking" && typeof part.thinking === "string") {
+        thinking += part.thinking;
       } else if (part.type === "image") {
         const url = mediaToImageUrl(part.media);
         if (url) imageUrls.push(url);
@@ -74,12 +78,16 @@ export function universalToOpenAIChatMessages(universal: UniversalBody): OpenAIC
           },
         });
       } else if (part.type === "tool_result" && part.tool_result) {
+        for (const media of toolResultImages(part.tool_result.result)) {
+          const url = mediaToImageUrl(media);
+          if (url) imageUrls.push(url);
+        }
         toolResults.push({
           id: part.tool_result.tool_call_id,
           content: resultToString(part.tool_result.result),
         });
       }
-      // thinking parts are intentionally dropped from OpenAI history.
+      // Other providers keep the existing history contract.
     }
 
     if (msg.role === "system") {
@@ -91,6 +99,7 @@ export function universalToOpenAIChatMessages(universal: UniversalBody): OpenAIC
         content: toolCalls.length > 0 ? (text || null) : text,
       };
       if (toolCalls.length > 0) m.tool_calls = toolCalls;
+      if (preserveThinking && thinking) m.reasoning_content = thinking;
       out.push(m);
     } else {
       // user (or tool) role: tool results must become standalone `tool`
@@ -145,6 +154,10 @@ export function universalToOpenAIResponsesInput(universal: UniversalBody): Respo
           arguments: JSON.stringify(part.tool_call.arguments ?? {}),
         });
       } else if (part.type === "tool_result" && part.tool_result) {
+        for (const media of toolResultImages(part.tool_result.result)) {
+          const url = mediaToImageUrl(media);
+          if (url) imageUrls.push(url);
+        }
         fnOutputs.push({
           type: "function_call_output",
           call_id: part.tool_result.tool_call_id,

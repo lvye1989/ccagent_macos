@@ -24,12 +24,17 @@ function check(value: unknown, label: string): void {
   assert.ok(value, label); checks++; console.log(`  [PASS] ${label}`);
 }
 const taskRoot = await fs.mkdtemp(path.join(os.tmpdir(), "ccagent-agent-controls-"));
+const { loginForTest } = await import("./helpers/accountFixture.js");
 const oldHome = process.env.CCAGENT_HOME;
 const oldFetch = globalThis.fetch;
 const oldKey = process.env.TEST_AGENT_CONTROLS_KEY;
 process.env.CCAGENT_HOME = path.join(taskRoot, "user");
+const accountFixture = await loginForTest(process.env.CCAGENT_HOME);
 const settingsPath = path.join(process.env.CCAGENT_HOME, "settings.json");
-globalThis.fetch = async () => { throw new Error("Unexpected network request"); };
+globalThis.fetch = async (url, init) => {
+  if (String(url).startsWith(accountFixture.origin + "/")) return oldFetch(url, init);
+  throw new Error("Unexpected network request");
+};
 const context: ToolContext = { cwd: taskRoot, sessionId: "agent-controls-test" };
 const engine = new QueryEngine({ model: "no-network", toolContext: context });
 const makeEngine = (ask: ToolContext["requestUserQuestion"]) => new QueryEngine({
@@ -60,13 +65,14 @@ try {
   const plugin = { ...getBuiltInAgents()[0], agentType: "plugin:helper", source: "plugin" as const };
   const definitions = [...getAllAgents(), plugin];
   setAgents(definitions);
-  check(getAllAgents().length === 6, "Built-in, project and plugin definitions are loaded");
+  const expectedAgents = getBuiltInAgents().length + 2;
+  check(getAllAgents().length === expectedAgents, "Built-in, project and plugin definitions are loaded");
   check(!classifyUserInput("/agents").isLlmTriggering, "Agent menu is a local command");
   const originalTools = getAllTools().map((t) => t.name).join(",");
   const originalTeams = isAgentTeamsEnabled();
   const originalSkills = isAgentSkillsEnabled();
   check((await command("/agents list")).includes("Open · built-in"), "List reports per-agent state and source");
-  check((await command("/agents")).includes("6 loaded"), "Noninteractive bare command retains detailed listing");
+  check((await command("/agents")).includes(`${expectedAgents} loaded`), "Noninteractive bare command retains detailed listing");
 
   check((await command("/agents close rhino_agent")).includes("Close"), "Direct Close applies to built-in Rhino");
   check(!isAgentEnabled("rhino_agent") && isAgentEnabled("Explore"), "Only selected agent is closed");
@@ -104,25 +110,38 @@ try {
   check(await fs.readFile(customFile, "utf8") === customText, "Agent definition files are unchanged");
 
   let cards = 0;
+  let opened = 0;
+  let checkedPage = false;
+  const rhinoPage = Math.floor(getAllAgents().findIndex(agent => agent.agentType === "rhino_agent") / 3) + 1;
+  const pageCount = Math.ceil(getAllAgents().length / 3);
   const interactive = makeEngine(async (req) => {
     const q = req.questions[0]; cards++;
     assert.ok(q.options.length <= 4);
-    if (cards === 1) return { answers: { [q.question]: "Next page" } };
-    if (cards === 2) {
-      check(q.options[0].label.includes("rhino_agent") && q.options[0].description?.includes("Close"), "Second menu page shows closed Rhino with correct status");
-      return { answers: { [q.question]: q.options[0].label } };
+    if (q.header === "Agent switch") {
+      assert.deepEqual(q.options.map((o) => o.label), ["Open", "Close", "返回"]);
+      opened++;
+      return { answers: { [q.question]: "Open" } };
     }
-    assert.deepEqual(q.options.map((o) => o.label), ["Open", "Close"]);
-    return { answers: { [q.question]: "Open" } };
+    if (opened === 2) return null;
+    if (opened === 1 && !checkedPage) {
+      const rhino = q.options.find(option => option.label.endsWith(". rhino_agent"));
+      check(q.question.includes(`(${rhinoPage}/${pageCount})`) && rhino?.description?.includes("Open"), "Agent picker preserves page and refreshes the saved state");
+      checkedPage = true;
+    }
+    const target = opened === 0 ? "rhino_agent" : "plugin:helper";
+    const option = q.options.find(option => option.label.endsWith(`. ${target}`));
+    if (option && opened === 0) check(option.description?.includes("Close"), "Agent menu shows closed Rhino with correct status");
+    return { answers: { [q.question]: option?.label ?? "Next page" } };
   });
-  check((await command("/agents", interactive)).includes("Open") && cards === 3, "Real QueryEngine supports paginated agent picker and native Open/Close card");
-  check(isAgentEnabled("rhino_agent") && !isAgentEnabled("reviewer"), "Interactive Open changes only selected agent");
-  const closeMenu = makeEngine(async (req) => ({ answers: { [req.questions[0].question]: "Close" } }));
+  check((await command("/agents", interactive)).includes("Open") && opened === 2 && cards >= 6, "Real QueryEngine edits multiple agents within one menu and exits explicitly");
+  check(isAgentEnabled("rhino_agent") && isAgentEnabled("plugin:helper") && !isAgentEnabled("reviewer"), "Interactive Open changes only selected agents");
+  const closeMenu = makeEngine(async (req) => req.questions[0].header === "Agent switch"
+    ? { answers: { [req.questions[0].question]: "Close" } } : null);
   check((await command("/agents rhino_agent", closeMenu)).includes("Close"), "Named-agent card also supports Close");
   const saved = await fs.readFile(settingsPath, "utf8");
-  check((await command("/agents", makeEngine(async () => null))).includes("cancelled"), "Cancelling picker does not change settings");
-  check((await command("/agents Explore", makeEngine(async () => null))).includes("cancelled"), "Cancelling state card does not change settings");
-  check((await command("/agents Explore", makeEngine(async (req) => ({ answers: { [req.questions[0].question]: "unknown choice" } })))).includes("cancelled"), "Unknown free-text choice never changes state");
+  check((await command("/agents", makeEngine(async () => null))).includes("设置已结束"), "Cancelling picker does not change settings");
+  check((await command("/agents Explore", makeEngine(async () => null))).includes("设置已结束"), "Cancelling state card does not change settings");
+  check((await command("/agents Explore", makeEngine(async (req) => ({ answers: { [req.questions[0].question]: "unknown choice" } })))).includes("设置已结束"), "Unknown free-text choice never changes state");
   check((await command("/agents", makeEngine(async () => { throw new Error("question fixture error"); }))).includes("question fixture error"), "Question errors produce local diagnostics");
   check((await command("/agents close missing-agent")).includes("Unknown agent"), "Unknown agent rejected");
   check((await command("/agents open Explore extra")).includes("Usage:"), "Extra arguments rejected");
@@ -175,7 +194,7 @@ try {
   check(modelCalls === 1, "Subsequent invocation of the closed agent cannot make a model request");
 
   await Promise.all(getAllAgents().map((agent) => setAgentState(agent.agentType, "close")));
-  check(getEnabledAgents().length === 0 && (await command("/agents list")).includes("6 loaded"), "All agents may be closed while management retains every definition");
+  check(getEnabledAgents().length === 0 && (await command("/agents list")).includes(`${expectedAgents} loaded`), "All agents may be closed while management retains every definition");
   check((await command("/agents OPEN plugin:helper")).includes("Open") && getEnabledAgents().length === 1, "Local menu/direct commands can reopen an agent when all are closed");
 
   await fs.writeFile(settingsPath, "{ invalid", "utf8");
@@ -190,9 +209,10 @@ try {
   check((await command("/agents open Explore")).includes("JSON object"), "Non-object settings cannot be overwritten");
   await fs.writeFile(settingsPath, "{}");
   await bootstrapAgentStates();
-  check(getEnabledAgents().length === 6, "Repaired settings restore default Open without reloading definitions");
+  check(getEnabledAgents().length === expectedAgents, "Repaired settings restore default Open without reloading definitions");
   console.log(`\nAll ${checks} per-agent control checks passed (external network blocked/mocked).`);
 } finally {
+  await accountFixture.close();
   await tick(30); // Let read-only scheduler listeners settle before removing the test-owned root.
   clearWorkfriendTimers(); clearPendingNotifications(); clearAgents();
   globalThis.fetch = oldFetch;

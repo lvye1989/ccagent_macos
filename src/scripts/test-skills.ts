@@ -47,6 +47,7 @@ async function main(): Promise<void> {
   // Build the documented fixture set in a disposable project so this test is
   // deterministic and cannot be affected by (or overwrite) the user's skills.
   cwd = await mkdtemp(path.join(os.tmpdir(), "ccagent-skills-"));
+  process.env.CCAGENT_HOME = path.join(cwd, "user-home");
   const skillsDir = path.join(cwd, ".ccagent", "skills");
   const fixtures: Record<string, string> = {
     "hello-world": `---
@@ -227,7 +228,8 @@ Dotted skill received $ARGUMENTS.
   console.log("\nAll skills checks passed.\n");
 }
 
-main().catch((err: unknown) => {
+const { withTestAccount } = await import("./helpers/accountFixture.js");
+withTestAccount(main).catch((err: unknown) => {
   console.error("Fatal:", err);
   process.exit(1);
 });

@@ -18,7 +18,8 @@
  */
 
 import type { Skill } from "../../types/types.js";
-import { isAgentSkillsEnabled } from "../../utils/agentSkillsEnabled.js";
+import { isAgentSkillsEnabled, isSkillEnabled } from "../../utils/agentSkillsEnabled.js";
+import { canonicalSkillName } from "./names.js";
 
 const dynamic = new Map<string, Skill>();
 const conditional = new Map<string, Skill>();
@@ -32,7 +33,13 @@ let initialized = false;
 export function setSkills(skills: Skill[]): void {
   dynamic.clear();
   conditional.clear();
-  for (const skill of skills) {
+  const canonicalDefinitions = new Set(skills.filter((s) => s.name === canonicalSkillName(s.name)).map((s) => `${s.source}:${s.name}`));
+  for (const original of skills) {
+    const name = canonicalSkillName(original.name);
+    if (name !== original.name && canonicalDefinitions.has(`${original.source}:${name}`)) continue;
+    const skill = name === original.name ? original : { ...original, name };
+    dynamic.delete(name);
+    conditional.delete(name);
     if (skill.frontmatter.paths && skill.frontmatter.paths.length > 0) {
       conditional.set(skill.name, skill);
     } else {
@@ -53,7 +60,7 @@ export function isSkillsInitialized(): boolean {
  */
 export function getModelVisibleSkills(): Skill[] {
   if (!isAgentSkillsEnabled()) return [];
-  return [...dynamic.values()].filter((s) => !s.frontmatter.disableModelInvocation);
+  return [...dynamic.values()].filter((s) => isSkillEnabled(s.name) && !s.frontmatter.disableModelInvocation);
 }
 
 /**
@@ -64,11 +71,19 @@ export function getModelVisibleSkills(): Skill[] {
  */
 export function getAllUserInvocableSkills(): Skill[] {
   if (!isAgentSkillsEnabled()) return [];
-  return [...dynamic.values(), ...conditional.values()];
+  return getInstalledSkills().filter((s) => isSkillEnabled(s.name));
 }
+
+/** Management inventory includes closed, hidden and conditional definitions. */
+export function getInstalledSkills(): Skill[] { return [...dynamic.values(), ...conditional.values()]; }
+export function removeSkill(name: string): void { name = canonicalSkillName(name); dynamic.delete(name); conditional.delete(name); }
+
+/** Shared CLI/Web inventory, including disabled definitions. */
+export const getAllSkills = getInstalledSkills;
 
 /** Raw lookup for diagnostics/closed-command detection; execution must check the switch. */
 export function findSkill(name: string): Skill | undefined {
+  name = canonicalSkillName(name);
   return dynamic.get(name) ?? conditional.get(name);
 }
 
@@ -78,7 +93,8 @@ export function findSkill(name: string): Skill | undefined {
  * UI ("activated skill X").
  */
 export function activateConditional(name: string): boolean {
-  if (!isAgentSkillsEnabled()) return false;
+  name = canonicalSkillName(name);
+  if (!isAgentSkillsEnabled() || !isSkillEnabled(name)) return false;
   const skill = conditional.get(name);
   if (!skill) return false;
   conditional.delete(name);
@@ -89,7 +105,7 @@ export function activateConditional(name: string): boolean {
 /** Iterate over the conditional skills (read-only view). */
 export function listConditionalSkills(): Skill[] {
   if (!isAgentSkillsEnabled()) return [];
-  return [...conditional.values()];
+  return [...conditional.values()].filter((s) => isSkillEnabled(s.name));
 }
 
 /** Drop everything — only used by tests / hot reload. */

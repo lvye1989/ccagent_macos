@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   console.log("[1] Built-in agent and tools");
   const agents = getBuiltInAgents();
   const rhino = agents.find((agent) => agent.agentType === "rhino_agent");
-  assert(agents.length === 4, "four built-in agents are registered");
+  assert(agents.length === 5, "five built-in agents are registered, including image_reader");
   assert(Boolean(rhino), "rhino_agent is built in");
   assert(rhino?.permissionMode === "auto", "rhino_agent uses Auto Mode for fast Jev-gated operations");
   assert(
@@ -100,11 +100,12 @@ async function main(): Promise<void> {
     "vision_analysis cannot run without a native Rhino viewport capture",
   );
 
-  const visionEnvNames = ["QWEN_MODEL", "QWEN_PROTOCOL", "QWEN_BASE_URL", "QWEN_API_KEY", "DASHSCOPE_BASE_URL", "DASHSCOPE_API_KEY", "CCAGENT_HOME"] as const;
+  const visionEnvNames = ["QWEN_MODEL", "QWEN_OMNI_MODEL", "QWEN_PROTOCOL", "QWEN_BASE_URL", "QWEN_API_KEY", "DASHSCOPE_BASE_URL", "DASHSCOPE_API_KEY", "CCAGENT_HOME"] as const;
   const previousVisionEnv = Object.fromEntries(visionEnvNames.map((name) => [name, process.env[name]]));
   try {
     process.env.CCAGENT_HOME = path.join(fixtureRoot, "vision-home");
-    process.env.QWEN_MODEL = "qwen-vision-fixture";
+    process.env.QWEN_MODEL = "qwen3.8-max,qwen3.8-flash";
+    process.env.QWEN_OMNI_MODEL = "qwen-vision-fixture";
     process.env.QWEN_PROTOCOL = "openai-chat";
     process.env.QWEN_BASE_URL = "https://vision.invalid/v1";
     process.env.QWEN_API_KEY = "TEST_ONLY";
@@ -134,6 +135,8 @@ async function main(): Promise<void> {
   assert(["create_curve","surface","solid_edit","mesh","subd","group_manage"].every(a => (RHINO_ACTIONS as readonly string[]).includes(a)), "common modeling action families are registered");
   const loftInput = { action: "loft", observation_id: "obs-1", intent: "Reference tower", parameters: { sections: [{z:0,width:44,depth:44},{z:180,width:30.8,depth:30.8},{z:300,width:38,depth:38}], cap:false, crown_dip:2, expected_units:"Meters" } };
   assert(parseRhinoActionInput(loftInput, process.cwd()).action === "loft", "numerical section loft parses");
+  throws(() => parseRhinoActionInput({ ...loftInput, parameters: { ...loftInput.parameters, cap: true } }, process.cwd()), "non-planar", "dipped crown cap conflict is rejected before Jev or a Rhino mutation");
+  assert(parseRhinoActionInput({ ...loftInput, parameters: { ...loftInput.parameters, cap: true, crown_dip: 0 } }, process.cwd()).parameters.cap === true, "explicit planar crown can request capping");
   throws(() => parseRhinoActionInput({ ...loftInput, parameters: { target_guids: Array.from({length:65}, (_, i) => `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`) } }, process.cwd()), "2-64", "curve loft and numerical loft share the 64-profile limit");
   throws(() => parseRhinoActionInput({ ...loftInput, parameters: {sections:[{z:10,width:4,depth:4},{z:0,width:3,depth:3}]} }, process.cwd()), "strictly increasing", "reversed profiles are rejected before Rhino mutation");
   throws(() => parseRhinoActionInput({ action:"curtain_wall", observation_id:"obs-1", intent:"facade", parameters:{target_guids:["00000000-0000-4000-8000-000000000001"],floors:200,bays_per_side:80} }, process.cwd()), "30000 panel", "unbounded facade generation is rejected");

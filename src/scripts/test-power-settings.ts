@@ -15,10 +15,11 @@ import { mailTool } from "../tools/mailTool.js";
 import type { ToolContext } from "../tools/Tool.js";
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "ccagent-powersetting-"));
-const home = path.join(root, "user");
+const { loginForTest } = await import("./helpers/accountFixture.js");
 const previousHome = process.env.CCAGENT_HOME;
 const previousFetch = globalThis.fetch;
-process.env.CCAGENT_HOME = home;
+const accountFixture = await loginForTest(path.join(root, "user"));
+const home = accountFixture.home;
 globalThis.fetch = async () => { throw new Error("Local command unexpectedly called a provider"); };
 const settingsPath = path.join(home, "settings.json");
 const context: ToolContext = { cwd: root, sessionId: "powersetting-fixture" };
@@ -91,18 +92,29 @@ try {
     "Unknown command argument cannot change permissions");
 
   let questions = 0;
+  const answers = ["QQ 邮箱", "读", "开", "读", "关", "下一页", "查", "开", "查", "返回", "切换邮箱", "163 邮箱", "写", "开", null];
   const interactive: ToolContext = { ...context, requestUserQuestion: async (request) => {
-    questions++;
     const question = request.questions[0];
-    const answer = question.header === "邮箱" ? "QQ 邮箱"
-      : question.header === "权限" && question.question.includes("1/2") ? "下一页"
-      : question.header === "权限" ? "查" : "开";
+    assert.ok(questions < answers.length, "Menu must exit after cancellation");
+    const answer = answers[questions++];
+    assert.ok(question.options.length <= 4);
+    assert.equal(question.cancelLabel, "完成设置");
+    if (questions === 5) assert.ok(question.question.includes("当前为 On"), "State card must use the saved value");
+    if (questions === 9) {
+      assert.ok(question.question.includes("2/3"), "Saving must preserve the permission page");
+      assert.ok(question.options.find((o) => o.label === "查")?.description?.includes("On"));
+    }
+    if (answer === null) return null;
     assert.ok(question.options.some((option) => option.label === answer));
     return { answers: { [question.question]: answer } };
   } };
   check((await command("/powersetting", interactive)).includes("查信：On") &&
-    await isMailPowerEnabled("qq", "search") && questions === 4,
-    "Interactive menu can select account, second-page power, and On");
+    await isMailPowerEnabled("qq", "search") && !(await isMailPowerEnabled("qq", "read")) &&
+    await isMailPowerEnabled("163", "draft") && questions === answers.length,
+    "One menu supports repeated saves, refreshed states, paging, Back, account switching, and explicit exit");
+  check((await command("/powersetting qq send on", {
+    ...context, requestUserQuestion: async () => { throw new Error("Explicit commands must not open a menu"); },
+  })).includes("发送邮件：On"), "Explicit arguments remain one-shot even with an interactive UI");
   const beforeCancel = await loadMailPowerSettings();
   check((await command("/powersetting", {
     ...context, requestUserQuestion: async () => null,
@@ -122,6 +134,7 @@ try {
 
   console.log(`\nAll ${checks} mail power setting checks passed.`);
 } finally {
+  await accountFixture.close();
   globalThis.fetch = previousFetch;
   if (previousHome === undefined) delete process.env.CCAGENT_HOME;
   else process.env.CCAGENT_HOME = previousHome;

@@ -16,22 +16,22 @@ function status(connection: McpServerConnection, toolCount: number): string {
     ? `Open / ${connection.discoveryError}` : `Open / connected · ${toolCount} tool(s)`;
 }
 
-async function selectServer(ask: Ask): Promise<string | undefined> {
+async function selectServer(ask: Ask, cursor: { page: number }): Promise<string | undefined> {
   const entries = getMcpRegistry();
-  let page = 0;
   const pageCount = Math.ceil(entries.length / 3);
+  cursor.page = Math.min(cursor.page, Math.max(0, pageCount - 1));
   while (entries.length) {
-    const question = `选择 MCP 服务 (${page + 1}/${pageCount})；Esc 退出`;
-    const slice = entries.slice(page * 3, page * 3 + 3);
+    const question = `选择 MCP 服务 (${cursor.page + 1}/${pageCount})；Esc 完成设置`;
+    const slice = entries.slice(cursor.page * 3, cursor.page * 3 + 3);
     const options = slice.map(({ connection, tools }, i) => ({
       label: `${i + 1}. ${connection.name}`,
       description: status(connection, tools.length),
     }));
     if (pageCount > 1) options.push({ label: "Next page", description: "下一页（循环）" });
-    const response = await ask({ questions: [{ header: "MCP", question, options }] });
+    const response = await ask({ questions: [{ header: "MCP", question, options, cancelLabel: "完成设置" }] });
     const answer = response?.answers[question];
     if (!answer) return undefined;
-    if (answer === "Next page" && pageCount > 1) { page = (page + 1) % pageCount; continue; }
+    if (answer === "Next page" && pageCount > 1) { cursor.page = (cursor.page + 1) % pageCount; continue; }
     const index = options.findIndex((option) => option.label === answer);
     if (index >= 0 && index < slice.length) return slice[index].connection.name;
     // Free text is accepted only when it is an exact configured server name.
@@ -45,12 +45,29 @@ export async function* handleMcpCommand(
   args: string[],
   ask?: ToolContext["requestUserQuestion"],
 ): AsyncGenerator<QueryEngineEvent, { handled: boolean }> {
+  const cursor = { page: 0 };
+  const namedServer = getMcpRegistryEntry(args.join(" "));
+  if (namedServer) {
+    cursor.page = Math.floor(Math.max(0, getMcpRegistry().findIndex((entry) => entry === namedServer)) / 3);
+  }
+  const interactive = Boolean(ask) && (args.length === 0 || (args[0] !== "list" && Boolean(namedServer)));
+  let nextArgs = args;
+  for (;;) {
+    const result = yield* handleMcpSelection(nextArgs, ask, cursor);
+    if (!interactive || result.exitMenu) return { handled: true };
+    nextArgs = [];
+  }
+}
+
+async function* handleMcpSelection(
+  args: string[], ask: ToolContext["requestUserQuestion"], cursor: { page: number },
+): AsyncGenerator<QueryEngineEvent, { handled: boolean; exitMenu?: boolean }> {
   let [sub, ...rest] = args;
   let target = rest.join(" ");
   const entries = getMcpRegistry();
   if (!entries.length && (!sub || sub === "list")) {
     yield { type: "command", kind: "info", message: "MCP Servers (0 configured)\n\nNo MCP servers configured. Add them under \"mcpServers\" in:\n  ~/.ccagent/settings.json   (user-wide)\n  .ccagent/settings.json      (project-only)" };
-    return { handled: true };
+    return { handled: true, exitMenu: true };
   }
   if (sub === "list" || (!sub && !ask)) {
     yield { type: "command", kind: "info", message: [
@@ -61,10 +78,10 @@ export async function* handleMcpCommand(
     return { handled: true };
   }
   if (!sub && ask) {
-    target = await selectServer(ask) ?? "";
+    target = await selectServer(ask, cursor) ?? "";
     if (!target) {
-      yield { type: "command", kind: "info", message: "MCP selection cancelled; no settings changed." };
-      return { handled: true };
+      yield { type: "command", kind: "info", message: "MCP 设置已结束，已保存的修改立即生效。" };
+      return { handled: true, exitMenu: true };
     }
     sub = "select";
   } else if (getMcpRegistryEntry(args.join(" "))) {
@@ -87,14 +104,16 @@ export async function* handleMcpCommand(
       return { handled: true };
     }
     const question = `${target}：选择 Open 或 Close（${status(entry.connection, entry.tools.length)}）`;
-    const response = await ask({ questions: [{ header: "MCP switch", question, options: [
+    const response = await ask({ questions: [{ header: "MCP switch", question, cancelLabel: "完成设置", options: [
       { label: "Open", description: "启用并连接；需要授权时使用 /mcp auth，不自动弹浏览器。" },
       { label: "Close", description: "停止连接、取消待处理授权并撤下工具；保留配置与令牌。" },
+      { label: "返回", description: "返回 MCP 服务列表，保留当前设置。" },
     ] }] });
     const answer = response?.answers[question]?.toLowerCase();
+    if (answer === "返回") return { handled: true };
     if (answer !== "open" && answer !== "close") {
-      yield { type: "command", kind: "info", message: "MCP selection cancelled; no settings changed." };
-      return { handled: true };
+      yield { type: "command", kind: "info", message: "MCP 设置已结束，已保存的修改立即生效。" };
+      return { handled: true, exitMenu: true };
     }
     sub = answer;
   }
@@ -121,6 +140,7 @@ export async function* handleMcpCommand(
     }
   } catch (error) {
     yield { type: "command", kind: "error", message: (error as Error).message };
+    return { handled: true, exitMenu: true };
   }
   return { handled: true };
 }

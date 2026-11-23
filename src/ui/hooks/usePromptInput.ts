@@ -10,6 +10,8 @@ import { useTextInput } from "./useTextInput.js";
 import { readClipboardImage } from "../utils/screenshotClipboard.js";
 import { parsePastedImagePath, readImageAsBlock } from "../../tools/imageUtils.js";
 import { addPastedImage, imageRefToken } from "../../core/pastedImages.js";
+import { parsePastedAudioPath, readAudioAsBlock } from "../../tools/audioUtils.js";
+import { addPastedAudio, audioRefToken } from "../../core/pastedAudio.js";
 import type { ImageBlock } from "../../types/message.js";
 import {
   buildDefaultThinkingConfig,
@@ -82,7 +84,7 @@ const BUILTIN_COMMANDS: CommandSuggestion[] = [
   { name: "/clear", description: "Clear conversation history" },
   { name: "/config", description: "Inspect or change settings (list/get/set, --user/--project/--local)" },
   { name: "/cost", description: "Show session token usage" },
-  { name: "/model", description: "Inspect current model or override it for this session" },
+  { name: "/model", description: "Select a model for this session or save it as the default" },
   { name: "/mode", description: "Inspect or switch permission mode (default/plan/auto/full)" },
   { name: "/think", description: "Control extended thinking (on/off/<budget>)" },
   { name: "/effort", description: "Set reasoning effort (low/medium/high/max, Anthropic)" },
@@ -108,7 +110,7 @@ const BUILTIN_COMMANDS: CommandSuggestion[] = [
   { name: "/init", description: "Analyze the repo and draft an AGENT.md (runs a model turn)" },
   { name: "/workfriend", description: "Start a work/mood check-in and end-of-day companion" },
   { name: "/agent-team", description: "Open or close Agent Teams (interactive choice)" },
-  { name: "/agent-skill", description: "Open or close Skills (interactive choice)" },
+  { name: "/agent-skill", description: "List installed skills; open, close or delete individual skills" },
   { name: "/permissions", description: "List/add/remove allow & deny rules by layer (alias: /allowed-tools)" },
   { name: "/memory", description: "List AGENT.md + project memory files; edit one in $EDITOR (/memory edit <n>)" },
   { name: "/exit", description: "Exit the session" },
@@ -421,6 +423,21 @@ export function usePromptInput({
       });
   };
 
+  const attachAudioFromPath = (absPath: string, at: number, snapshot: string) => {
+    onNotice?.({ tone: "info", title: "Audio", body: "Preparing audio attachment…" });
+    void readAudioAsBlock(absPath).then((audio) => {
+      if (!audio.ok) {
+        onNotice?.({ tone: "error", title: "Audio", body: audio.error });
+        return;
+      }
+      const id = addPastedAudio({ ...audio, filename: path.basename(absPath) });
+      spliceTokenInto(at, snapshot, `${audioRefToken(id)} `);
+      onNotice?.({ tone: "info", title: "Audio", body: `${path.basename(absPath)} attached — press Enter to read with read-audio.` });
+    }).catch((error: unknown) => {
+      onNotice?.({ tone: "error", title: "Audio", body: error instanceof Error ? error.message : String(error) });
+    });
+  };
+
   // Pull an image off the system clipboard into the registry and chip it in.
   // Guarded against re-entrancy because the clipboard read is async
   // (osascript / pngpaste). The temp file is read then deleted — the bytes
@@ -475,6 +492,11 @@ export function usePromptInput({
 
     // Pasted an image *file* path (e.g. copied from Finder) → read it into the
     // registry and drop an `[Image #N]` chip (not the raw path).
+    const audioPath = parsePastedAudioPath(text);
+    if (audioPath) {
+      attachAudioFromPath(audioPath, cursorPos, inputValue);
+      return;
+    }
     const imgPath = parsePastedImagePath(text);
     if (imgPath) {
       attachImageFromPath(imgPath, cursorPos, inputValue);
@@ -616,6 +638,11 @@ export function usePromptInput({
     // reference so it rides the same pipeline as a typed `@image.png`. A paste
     // arrives as a multi-char `input` chunk (not a single keystroke).
     if (input && input.length > 1 && !key.ctrl && !key.meta) {
+      const audioPath = parsePastedAudioPath(input);
+      if (audioPath) {
+        attachAudioFromPath(audioPath, cursorPos, inputValue);
+        return;
+      }
       const imgPath = parsePastedImagePath(input);
       if (imgPath) {
         attachImageFromPath(imgPath, cursorPos, inputValue);

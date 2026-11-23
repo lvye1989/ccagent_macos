@@ -64,7 +64,16 @@ export function getEffectiveContextWindowSize(model: string, configuredContextWi
 }
 
 function roughTokenCountEstimation(content: string, charsPerToken = TEXT_CHARS_PER_TOKEN): number {
-  return Math.max(1, Math.round(content.length / charsPerToken));
+  // The four-ASCII-character heuristic severely undercounts Chinese and
+  // other non-ASCII text before a provider usage anchor exists (notably
+  // after resume). Count non-ASCII code units conservatively; surrogate
+  // pairs retain two units because emoji/supplementary scripts can use
+  // multiple tokens. English/JSON/base64 estimates remain unchanged.
+  let nonAscii = 0;
+  for (let index = 0; index < content.length; index++) {
+    if (content.charCodeAt(index) > 0x7f) nonAscii++;
+  }
+  return Math.max(1, Math.round((content.length - nonAscii) / charsPerToken + nonAscii));
 }
 
 function estimateUnknownObjectTokens(value: unknown): number {
@@ -81,6 +90,9 @@ function estimateContentBlockTokens(content: MessageParam["content"]): number {
   }
 
   return content.reduce((total, block) => {
+    // Internal audio is replaced by at most 8192 tokens of Omni evidence;
+    // counting its base64 as text would spuriously exhaust the context.
+    if ((block.type as string) === "audio") return total + 8_192;
     switch (block.type) {
       case "text":
         return total + roughTokenCountEstimation(block.text);
@@ -92,6 +104,9 @@ function estimateContentBlockTokens(content: MessageParam["content"]): number {
           estimateUnknownObjectTokens(block.input)
         );
       case "tool_result": {
+        if (Array.isArray(block.content) && block.content.some((part) => (part.type as string) === "audio")) {
+          return total + TOOL_BLOCK_OVERHEAD_TOKENS + estimateContentBlockTokens(block.content as MessageParam["content"]);
+        }
         const serialized = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
         return total + TOOL_BLOCK_OVERHEAD_TOKENS + roughTokenCountEstimation(serialized, JSON_CHARS_PER_TOKEN);
       }
@@ -117,6 +132,12 @@ export function estimateSystemPromptTokens(systemPrompt: string): number {
   return roughTokenCountEstimation(systemPrompt) + MESSAGE_OVERHEAD_TOKENS;
 }
 
+/** Schemas are mostly descriptions/JSON; use the same conservative margin as message estimates. */
+export function estimateToolDefinitionTokens(tools?: readonly unknown[]): number {
+  if (!tools?.length) return 0;
+  return Math.ceil(roughTokenCountEstimation(JSON.stringify(tools)) * 4 / 3);
+}
+
 export function getTokenCountFromUsage(usage: Usage): number {
   return (
     usage.input_tokens +
@@ -128,16 +149,42 @@ export function getTokenCountFromUsage(usage: Usage): number {
 
 export function tokenCountWithEstimation(
   messages: readonly MessageParam[],
-  options?: { usage?: Usage; usageAnchorIndex?: number; systemPrompt?: string },
+  options?: { usage?: Usage; usageAnchorIndex?: number; usageSystemPromptTokens?: number; usageToolDefinitionTokens?: number; systemPrompt?: string; toolDefinitions?: readonly unknown[] },
 ): number {
   const systemPromptTokens = options?.systemPrompt ? estimateSystemPromptTokens(options.systemPrompt) : 0;
+  const toolDefinitionTokens = estimateToolDefinitionTokens(options?.toolDefinitions);
 
-  if (options?.usage && options.usageAnchorIndex !== undefined && options.usageAnchorIndex >= 0) {
+  const usage = options?.usage;
+  const promptTokens = usage ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) : 0;
+  // A restored transcript has no per-request usage. Its zero-valued placeholder
+  // must not hide the history; cached-only prompts, however, are real usage.
+  if (usage && [usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens ?? 0, usage.cache_read_input_tokens ?? 0].every(value => Number.isFinite(value) && value >= 0)
+    && promptTokens > 0 && options?.usageAnchorIndex !== undefined
+    && Number.isInteger(options.usageAnchorIndex) && options.usageAnchorIndex >= 0 && options.usageAnchorIndex < messages.length) {
     const suffix = messages.slice(options.usageAnchorIndex + 1);
-    return getTokenCountFromUsage(options.usage) + roughTokenCountEstimationForMessages(suffix) + systemPromptTokens;
+    // Provider prompt usage already includes the system prompt and tool
+    // definitions. Only count messages added after its assistant response and
+    // growth of the dynamic system prompt since that same request.
+    const measuredTokens = getTokenCountFromUsage(usage) + roughTokenCountEstimationForMessages(suffix);
+    if (options.usageSystemPromptTokens !== undefined && Number.isFinite(options.usageSystemPromptTokens) && options.usageSystemPromptTokens >= 0) {
+      const toolBaseline = options.usageToolDefinitionTokens;
+      const hasToolBaseline = toolBaseline !== undefined && Number.isFinite(toolBaseline) && toolBaseline >= 0;
+      const dynamicToolGrowth = hasToolBaseline
+        ? Math.max(0, toolDefinitionTokens - toolBaseline)
+        : 0;
+      const measuredWithGrowth = measuredTokens + Math.max(0, systemPromptTokens - options.usageSystemPromptTokens) + dynamicToolGrowth;
+      // A legacy usage anchor cannot establish which schemas it already paid
+      // for. Use a visible-context floor instead of adding all tools twice.
+      return !hasToolBaseline
+        ? Math.max(measuredWithGrowth, roughTokenCountEstimationForMessages(messages) + systemPromptTokens + toolDefinitionTokens)
+        : measuredWithGrowth;
+    }
+    // Older callers lack the system snapshot. Keep the current visible prompt
+    // as a floor without adding its entire system prompt a second time.
+    return Math.max(measuredTokens, roughTokenCountEstimationForMessages(messages) + systemPromptTokens + toolDefinitionTokens);
   }
 
-  return roughTokenCountEstimationForMessages(messages) + systemPromptTokens;
+  return roughTokenCountEstimationForMessages(messages) + systemPromptTokens + toolDefinitionTokens;
 }
 
 export interface TokenBudgetSnapshot {
@@ -161,7 +208,10 @@ export function buildTokenBudgetSnapshot(
   options?: {
     usage?: Usage;
     usageAnchorIndex?: number;
+    usageSystemPromptTokens?: number;
+    usageToolDefinitionTokens?: number;
     systemPrompt?: string;
+    toolDefinitions?: readonly unknown[];
     model?: string;
     contextWindow?: number;
   },

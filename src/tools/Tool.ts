@@ -13,6 +13,7 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ContentBlock } from "../types/message.js";
+import type { ToolDiscoveryRequest, ToolDiscoveryResult } from "./toolDiscovery.js";
 
 // ─── Interactive questions (AskUserQuestion) ───────────────────────
 
@@ -32,6 +33,8 @@ export interface UserQuestion {
   options: UserQuestionOption[];
   /** Allow selecting more than one option. */
   multiSelect?: boolean;
+  /** Label for the cancel/exit row in local settings menus. */
+  cancelLabel?: string;
 }
 
 export interface UserQuestionRequest {
@@ -50,8 +53,18 @@ export interface UserQuestionResponse {
 
 /** Runtime context passed to every tool invocation. */
 export interface ToolContext {
+  /** Conversation-scoped discovery; only exposes this agent's enabled tool pool. */
+  discoverTools?: (request: ToolDiscoveryRequest) => ToolDiscoveryResult;
   /** Current working directory */
   cwd: string;
+  /** Runtime-only closed tool scope. An empty scope enables no tools; never fall back to the global registry. */
+  scopedTools?: readonly Tool[];
+  /** Runtime-only constraint: a text-only official route must not use a personal vision key. */
+  officialVisionOnly?: boolean;
+  /** Entrypoint-owned application policy; never supplied or disabled by model input. */
+  applicationProtection?: boolean;
+  /** Verified main-conversation identity; a child must not substitute its own model. */
+  conversationMainModel?: string;
   /** Abort signal for cancellation */
   abortSignal?: AbortSignal;
   /** Callback to switch permission mode at runtime (set by QueryEngine). */
@@ -66,6 +79,19 @@ export interface ToolContext {
    * `agentId ?? getSessionId()` lookup pattern in `appState.todos[todoKey]`.
    */
   sessionId?: string;
+  /** Root conversation receives nested background task completions. */
+  notificationOwnerSessionId?: string;
+  /** Web conversations must never consume legacy unowned notifications. */
+  strictNotificationScope?: boolean;
+  /** Temporary Web chat: suppress durable conversation memory. */
+  temporaryChat?: boolean;
+  /** Runtime-only delivery hook for verified native model exports; inherited by child agents. */
+  onModelExport?: (filePath: string, projectDirectory: string) => Promise<void>;
+  /** Runtime-owned, bounded progress updates; never a model-controlled callback. */
+  onToolProgress?: (progress: { id: string; name: string; detail: string }) => void;
+  /** Web conversation preference; undefined retains the CLI's global default. */
+  agentTeamsAllowed?: boolean;
+  sessionInstructions?: string;
 
   /**
    * Stage 26 — id of the active user turn. File-history snapshots bind to
@@ -276,6 +302,7 @@ export function toolResultText(content: string | ContentBlock[]): string {
     .map((block) => {
       if (block.type === "text") return block.text;
       if (block.type === "image") return "[image]";
+      if (block.type === "audio") return "[audio]";
       return "";
     })
     .join("");

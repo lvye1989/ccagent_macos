@@ -7,9 +7,9 @@ This file provides guidance to AI agents when working with code in this reposito
 CCAGENT is a **terminal-native agentic coding CLI** packaged as `ccdagent` on npm. It installs the `ccagent` command.
 
 - Runtime: Node 22+, ESM, strict TS, target ES2022, JSX `react-jsx`
-- TUI: React 19 + Ink 7 (no web framework)
+- TUI: React 19 + Ink 7; local Web UI: `web/` and `src/entrypoint/web.ts`
 - Package manager: **npm** (`package-lock.json` is canonical — no pnpm/yarn/bun lockfiles)
-- Single-package repo (no monorepo)
+- CLI/Web package at the root; the Next.js account/admin service has its own package and lockfile under `cloud/`
 
 The code is organized into five broad layers:
 
@@ -29,6 +29,9 @@ There is **no** catch-all `npm test` and no lint/format script. Tests are smoke/
 - **Build:** `npm run build` → `tsup` (outputs the bundled `dist/ccagent.js` + sourcemap)
 - **Dev (no rebuild needed):** `npm run dev` → `tsx src/entrypoint/cli.ts`
 - **Start built binary:** `npm start` → `node dist/ccagent.js`
+- **Start local Web:** `npm run web` → `node dist/ccagent.js web`
+- **Cloud admin:** from `cloud/`, run `npm ci`, `npm run typecheck`, `npm run build`; local development uses port 4310. Account and database configuration are required for authenticated admin operations.
+- **Upstream baseline:** `lvye1989/ccagent`, branch `codebit`, commit `4edb0d9582a3e99ecf7352c02e4207ef4f950d58` (2026-11-12 +0800). Retain this repository's native macOS Computer Use and Rhino adapters. The imported desktop installer script currently targets Windows x64.
 - **Stage smokes:** `npm run test:stage20` … `test:stage36`
 - **Release gate:** `npm run verify:release`
 - **Domain smokes:** `test:queryengine`, `test:providerstream`, `test:notices`, `test:streaming`, `test:tasks`, `test:mcp`, `test:skills`, `test:sandbox`, `test:agents`, `test:filehistory`, `test:resilience`
@@ -50,6 +53,8 @@ Most `test:*` commands run files under `src/scripts/`, but **`test:stage30` is t
 - **`step/` is intentional tutorial code**, not a build artifact. It holds milestone snapshots (`step1.js` … `step35.js`) that mirror implementation stages; do not delete or clean it up.
 - **`dist/` is generated and ignored by git**. Rebuilding with `npm run build` replaces it with the single-file release artifact and sourcemap.
 - **Secrets/config caution:** `.env` and `.ccagent/settings.json` may contain local provider settings or secret-looking values. Do not copy token values into docs or output.
+- **Authenticated engine tests:** use `loginForTest` / `withTestAccount` from `src/scripts/helpers/accountFixture.ts`; keep the fixture account origin routed to the original fetch when mocking providers. Personal settings now live under the authenticated account home.
+- **Deferred tool fixtures:** model mocks must call `ToolSearch` before using a deferred tool. Keep tool call IDs unique across discovery and execution. Explicit scopes without `ToolSearch` retain their declared tools; tool predicates may depend on an owner initialized after `QueryEngine` construction.
 - **No `CONTRIBUTING.md`**; per the README, external contributions are not accepted yet, so conventions may shift.
 - **Multi-provider model config** lives in user/project `settings.json`:
   - Anthropic provider names pass through directly

@@ -175,7 +175,7 @@ async function main(): Promise<void> {
     );
 
     // openai-responses
-    cap = captureFetch(`data: [DONE]\n\n`);
+    cap = captureFetch(`data: {"type":"response.output_text.delta","delta":"ok"}\n\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n`);
     await drain({ id: "gpt5r", protocol: "openai-responses", model: "gpt-5.1", apiKey: "x" }, userImageMessages);
     const respInput = cap.body().input as Array<Record<string, unknown>>;
     const respUser = respInput.find((i) => i.role === "user");

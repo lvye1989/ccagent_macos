@@ -1,0 +1,132 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { QueryEngine } from "../core/queryEngine.js";
+import { bootstrapSkills } from "../services/skills/bootstrap.js";
+import { loadSkillsFromDir } from "../services/skills/loadSkillsDir.js";
+import { findSkill, getInstalledSkills, getModelVisibleSkills, getAllUserInvocableSkills, setSkills, clearSkills, activateConditional } from "../services/skills/registry.js";
+import { bootstrapAgentSkills, isAgentSkillsEnabled, isSkillEnabled, getSkillState } from "../utils/agentSkillsEnabled.js";
+import { skillTool } from "../tools/skillTool.js";
+import { fileReadTool } from "../tools/fileReadTool.js";
+import { analyzeAudioBlock } from "../services/audio/analyzeAudio.js";
+import { classifyUserInput } from "../ui/hooks/useAgentSession/inputClassification.js";
+import { getNestedCommandSuggestions } from "../ui/commandPalette.js";
+import { loginForTest } from "./helpers/accountFixture.js";
+
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "ccagent-skill-management-"));
+const oldHome = process.env.CCAGENT_HOME;
+const oldFetch = globalThis.fetch;
+const account = await loginForTest(path.join(root, "home"));
+const settingsPath = path.join(account.home, "settings.json");
+const userSkills = path.join(account.home, "skills");
+let checks = 0;
+const check = (value: unknown, label: string) => { assert.ok(value, label); checks++; console.log(`  [PASS] ${label}`); };
+globalThis.fetch = async (url, init) => {
+  if (String(url).startsWith(account.origin + "/")) return oldFetch(url, init);
+  throw new Error("Skill management must not call any provider");
+};
+const engine = new QueryEngine({ model: "fixture", toolContext: { cwd: root } });
+async function command(text: string, target = engine): Promise<string> {
+  const output: string[] = [];
+  for await (const event of target.submitMessage(text)) { assert.equal(event.type, "command"); if (event.type === "command") output.push(event.message); }
+  return output.join("\n");
+}
+async function install(dir: string, name: string, extra = "") {
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} fixture\n${extra}---\nRead-only fixture.\n`);
+}
+try {
+  await fs.mkdir(account.home, { recursive: true });
+  await fs.writeFile(settingsPath, JSON.stringify({ unrelated: { retained: true }, agentSkills: true }));
+  await install(path.join(userSkills, "alpha"), "alpha");
+  await install(path.join(userSkills, "beta"), "beta");
+  await install(path.join(userSkills, "邮件整理"), "邮件整理");
+  await install(path.join(root, ".ccagent", "skills", "conditional"), "conditional", 'paths:\n  - "**/*.ts"\n');
+  await install(path.join(userSkills, "hidden"), "hidden", "disable-model-invocation: true\n");
+  const pluginRoot = path.join(root, "plugin");
+  await install(path.join(pluginRoot, "skills", "fixture"), "fixture");
+  await fs.writeFile(path.join(pluginRoot, "unrelated-agent.txt"), "keep");
+  await bootstrapAgentSkills(); await bootstrapSkills(root);
+  const plugin = await loadSkillsFromDir(path.join(pluginRoot, "skills"), "plugin");
+  setSkills([...getInstalledSkills(), ...plugin.skills.map((s) => ({ ...s, name: "plugin:fixture", pluginRoot }))]);
+  const listing = await command("/agent-skill list");
+  check(["alpha", "beta", "hidden", "conditional", "plugin:fixture", "read-audio"].every((name) => listing.includes(name)), "List includes global, project, plugin, hidden and conditional installed skills");
+  check(getNestedCommandSuggestions("/agent-skill ")?.some((s) => s.name === "/agent-skill list"), "Command palette offers the installed skill list");
+  await command("/agent-skill close 邮件整理");
+  check(!isSkillEnabled("邮件整理") && (await command("/agent-skill open 邮件整理")).includes("Open"), "Individual management supports installed skills with Chinese names");
+  const betaText = await fs.readFile(path.join(userSkills, "beta", "SKILL.md"), "utf8");
+  await command("/agent-skill close alpha");
+  check(!isSkillEnabled("alpha") && isSkillEnabled("beta") && (await fs.readFile(settingsPath, "utf8")).includes('"alpha": "close"'), "Closing one skill persists immediately without closing others");
+  check(!getModelVisibleSkills().some((s) => s.name === "alpha") && !getAllUserInvocableSkills().some((s) => s.name === "alpha") && getInstalledSkills().some((s) => s.name === "alpha"), "Closed skills leave discovery/completion while remaining manageable");
+  check((await skillTool.call({ skill: "alpha" }, { cwd: root })).isError && !(await skillTool.call({ skill: "beta" }, { cwd: root })).isError, "Skill invocation enforces per-skill switches");
+  check((await command("/alpha")).includes("/agent-skill open alpha") && !classifyUserInput("/alpha").isLlmTriggering, "Closed slash commands remain local and provide reopening guidance");
+  await command("/agent-skill close conditional");
+  check(!activateConditional("conditional") && (await command("/agent-skill list")).includes("conditional · Close"), "Conditional skill activation honors its individual switch");
+  await command("/agent-skill close plugin:fixture");
+  setSkills(getInstalledSkills()); await bootstrapAgentSkills();
+  check(!isSkillEnabled("plugin:fixture"), "Plugin skill preferences survive registry reload and startup");
+  await command("/agent-skill close");
+  check((await command("/agent-skill list")).includes("beta") && !getModelVisibleSkills().length, "The installed inventory remains available while the global switch is closed");
+  check(getNestedCommandSuggestions("/agent-skill open c")?.some((s) => s.name === "/agent-skill open conditional" && s.description.includes("Close")), "Management completion includes individually closed skills even when the global switch is closed");
+  await command("/agent-skill open alpha");
+  check(!isAgentSkillsEnabled() && getSkillState("alpha") === "open", "Opening a single skill does not reopen the global switch");
+  await command("/agent-skill open");
+  check(isSkillEnabled("alpha") && !isSkillEnabled("conditional"), "Reopening globally preserves individual closed choices");
+  await command("/agent-skill close read_audio.skill");
+  const wav = path.join(root, "audio.wav"); await fs.writeFile(wav, "RIFF-fixture");
+  check((await fileReadTool.call({ file_path: wav }, { cwd: root })).isError, "Closing read_audio.skill blocks the native Read audio path");
+  await assert.rejects(analyzeAudioBlock({ type: "audio", source: { type: "base64", media_type: "audio/wav", format: "wav", data: "QUJD" } }, root), /closed/);
+  check(true, "Audio attachments also honor the individual skill switch without API calls");
+  const beforeCancel = await fs.readFile(settingsPath, "utf8");
+  check((await command("/agent-skill delete alpha")).includes("--yes") && await fs.readFile(settingsPath, "utf8") === beforeCancel, "Noninteractive deletion needs explicit confirmation and changes nothing otherwise");
+  const cancel = new QueryEngine({ model: "fixture", toolContext: { cwd: root, requestUserQuestion: async () => null } });
+  await command("/agent-skill delete alpha", cancel);
+  check(await fs.readFile(settingsPath, "utf8") === beforeCancel && Boolean(findSkill("alpha")), "Cancelling deletion preserves files and settings");
+  const deleted = await command("/agent-skill delete alpha --yes");
+  const trash = deleted.split("恢复副本：")[1];
+  const receipt = JSON.parse(await fs.readFile(path.join(trash, "restore.json"), "utf8"));
+  check(!findSkill("alpha") && !await fs.stat(path.join(userSkills, "alpha")).then(() => true).catch(() => false) && (await fs.readFile(path.join(receipt.backupPath, "SKILL.md"), "utf8")).includes("alpha fixture"), "Deleting a skill moves its folder into a recoverable archive and removes it from the live registry");
+  check(await fs.readFile(path.join(userSkills, "beta", "SKILL.md"), "utf8") === betaText && JSON.parse(await fs.readFile(settingsPath, "utf8")).unrelated.retained, "Deleting one skill preserves unrelated files and settings");
+  await command("/agent-skill delete read_audio.skill --yes");
+  await bootstrapAgentSkills(); await bootstrapSkills(root);
+  check(!findSkill("read_audio.skill") && getSkillState("read_audio.skill") === "deleted", "Deleted built-in skills are not automatically installed again on startup");
+  setSkills([...getInstalledSkills(), ...plugin.skills.map((s) => ({ ...s, name: "plugin:fixture", pluginRoot }))]);
+  await command("/agent-skill delete plugin:fixture --yes");
+  check(await fs.readFile(path.join(pluginRoot, "unrelated-agent.txt"), "utf8") === "keep" && !await fs.stat(path.join(pluginRoot, "skills", "fixture", "SKILL.md")).then(() => true).catch(() => false), "Deleting a plugin skill preserves its other components");
+  const outside = path.join(root, "outside-SKILL.md"); await fs.writeFile(outside, "---\nname: escape\n---\nKeep this file.");
+  await fs.mkdir(path.join(userSkills, "escape")); await fs.symlink(outside, path.join(userSkills, "escape", "SKILL.md"));
+  await bootstrapSkills(root);
+  check((await command("/agent-skill delete escape --yes")).includes("outside") && (await fs.readFile(outside, "utf8")).includes("Keep this file"), "Deletion refuses a symlink that resolves outside the installation directory");
+
+  const actions = ["List", "beta", "Close", "Open", "Delete", "取消", null, null, null];
+  let index = 0;
+  const interactive = new QueryEngine({ model: "fixture", toolContext: { cwd: root, requestUserQuestion: async ({ questions }) => {
+    assert.ok(index < actions.length && questions[0].options.length <= 4);
+    const q = questions[0], action = actions[index++];
+    if (action === null) return null;
+    const option = q.options.find((o) => o.label === action || o.label.startsWith(`${action} ·`));
+    assert.ok(option, `Missing action ${action}`);
+    return { answers: { [q.question]: option.label } };
+  } } });
+  const managed = await command("/agent-skill", interactive);
+  check(index === actions.length && managed.includes("beta: Close") && managed.includes("beta: Open") && findSkill("beta"), "One interactive session opens List, switches an individual skill repeatedly, cancels deletion, and returns to the parent menu");
+  check((await command("/agent-skill list")).includes("beta · Open") && !(await command("/agent-skill list")).includes("alpha ·"), "The refreshed inventory shows current state and omits removed definitions");
+  check(!getNestedCommandSuggestions("/agent-skill delete ")?.some((s) => s.name === "/agent-skill delete alpha"), "Deleted skills disappear from management completion immediately");
+  const confirmed = new QueryEngine({ model: "fixture", toolContext: { cwd: root, requestUserQuestion: async ({ questions }) => ({ answers: { [questions[0].question]: "确认删除" } }) } });
+  check((await command("/agent-skill delete 邮件整理", confirmed)).includes("恢复副本") && !findSkill("邮件整理"), "Interactive deletion requires and accepts the explicit confirmation");
+  const valid = await fs.readFile(settingsPath, "utf8");
+  await fs.writeFile(settingsPath, JSON.stringify({ skillStates: { beta: "invalid" } }));
+  check((await command("/agent-skill delete beta --yes")).includes("left untouched") && await fs.readFile(path.join(userSkills, "beta", "SKILL.md"), "utf8") === betaText && Boolean(findSkill("beta")), "A failed settings save rolls back the moved skill and preserves its live registration");
+  await fs.writeFile(settingsPath, "{ invalid json");
+  check((await command("/agent-skill delete beta --yes")).includes("left untouched") && await fs.readFile(path.join(userSkills, "beta", "SKILL.md"), "utf8") === betaText, "Malformed user settings prevent deletion without moving any files");
+  await fs.writeFile(settingsPath, valid);
+  await bootstrapAgentSkills();
+  check(getSkillState("alpha") === "deleted" && getSkillState("beta") === "open", "All individual preferences survive a complete settings reload");
+  console.log(`\nAll ${checks} skill management checks passed (loopback account only; no provider calls).`);
+} finally {
+  globalThis.fetch = oldFetch; clearSkills();
+  await account.close();
+  if (oldHome === undefined) delete process.env.CCAGENT_HOME; else process.env.CCAGENT_HOME = oldHome;
+  await fs.rm(root, { recursive: true, force: true });
+}

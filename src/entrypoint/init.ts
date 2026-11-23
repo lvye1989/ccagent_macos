@@ -5,6 +5,7 @@ import { deflateSync } from "node:zlib";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
 import { collectViaProvider } from "../services/api/providers/providerStream.js";
 import type { ModelProfile } from "../services/api/providers/profile.js";
+import { DEFAULT_QWEN_MODELS, DEFAULT_QWEN_OMNI_MODEL, getQwenOmniModel } from "../services/api/providers/modelConfig.js";
 import {
   callOpenRouterJev,
   DEFAULT_OPENROUTER_JEV_MODEL,
@@ -19,7 +20,6 @@ import { getCCAgentHome, getUserSettingsPath } from "../utils/paths.js";
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-flash";
 const DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-const DEFAULT_QWEN_MODEL = "qwen3.8-omni-flash";
 const DEFAULT_QWEN_TTS_MODEL = "qwen-audio-3.1-tts-flash";
 const DEFAULT_QWEN_TTS_VOICE = "longanhuan_v3.1";
 
@@ -192,7 +192,7 @@ export function buildUserSettings(
     deepseekModel: string;
     configureQwen: boolean;
     qwenBaseURL?: string;
-    qwenModel?: string;
+    qwenOmniModel?: string;
     configureGoogleMcp?: boolean;
     googleMcpRedirectUri?: string;
   },
@@ -207,15 +207,37 @@ export function buildUserSettings(
     apiKey: "${DEEPSEEK_API_KEY}",
     contextWindow: 1_048_576,
   };
-  const nextModels: Record<string, unknown> = { ...models, deepseek };
+  const nextModels: Record<string, unknown> = { ...models, deepseek,
+    ollama: {
+      ...objectValue(models.ollama),
+      protocol: "${OLLAMA_PROTOCOL:-openai-chat}",
+      model: "${OLLAMA_MODEL:-qwen3.8:27b-mtp-q8_0}",
+      baseURL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434/v1}",
+      contextWindow: objectValue(models.ollama).contextWindow ?? 65_536,
+    },
+  };
   const roles: Record<string, unknown> = { ...objectValue(existing.modelRoles) };
   const mcpServers: Record<string, unknown> = { ...objectValue(existing.mcpServers) };
 
   if (input.configureQwen) {
+    nextModels.qwen = {
+      ...objectValue(models.qwen),
+      protocol: "${QWEN_PROTOCOL:-openai-chat}",
+      model: "${QWEN_MODEL:-qwen3.8-max,qwen3.8-flash}",
+      baseURL: "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}",
+      apiKey: "${DASHSCOPE_API_KEY}",
+    };
+    nextModels["qwen-plus"] = {
+      ...objectValue(models["qwen-plus"]),
+      protocol: "openai-chat",
+      model: "${QWEN_PLUS_MODEL:-qwen-plus}",
+      baseURL: "${DASHSCOPE_BASE_URL}",
+      apiKey: "${DASHSCOPE_API_KEY}",
+    };
     nextModels["qwen-omni"] = {
       ...objectValue(models["qwen-omni"]),
       protocol: "${QWEN_PROTOCOL:-openai-chat}",
-      model: "${QWEN_MODEL:-qwen3.8-omni-flash}",
+      model: "${QWEN_OMNI_MODEL:-qwen3.8-omni-flash}",
       baseURL: "${DASHSCOPE_BASE_URL}",
       apiKey: "${DASHSCOPE_API_KEY}",
       maxTokens: 4096,
@@ -478,17 +500,17 @@ export async function runInitCommand(
     );
 
     const configureQwen = await prompter.confirm(
-      "配置 Qwen 视觉感知",
+      "配置 Qwen 主模型与 Omni 备用视觉感知",
       true,
     );
     let qwenApiKey = existing.env.DASHSCOPE_API_KEY || "";
     let qwenBaseURL = existing.env.DASHSCOPE_BASE_URL || DEFAULT_QWEN_BASE_URL;
-    let qwenModel = existing.env.QWEN_MODEL || DEFAULT_QWEN_MODEL;
+    let qwenOmniModel = getQwenOmniModel(existing.env) || DEFAULT_QWEN_OMNI_MODEL;
     if (configureQwen) {
       const keyInput = await prompter.secret("DashScope API Key", Boolean(qwenApiKey));
       qwenApiKey = keyInput || qwenApiKey;
       qwenBaseURL = await prompter.ask("DashScope Base URL", qwenBaseURL);
-      qwenModel = await prompter.ask("Qwen 视觉模型", qwenModel);
+      qwenOmniModel = await prompter.ask("Qwen Omni 备用视觉模型（主模型仅支持文本时使用）", qwenOmniModel);
     }
 
     const configureJev = await prompter.confirm(
@@ -533,7 +555,7 @@ export async function runInitCommand(
       deepseekModel,
       configureQwen,
       qwenBaseURL,
-      qwenModel,
+      qwenOmniModel,
       configureGoogleMcp,
       googleMcpRedirectUri,
     });
@@ -542,6 +564,9 @@ export async function runInitCommand(
       DEEPSEEK_PROTOCOL: "openai-responses",
       DEEPSEEK_MODEL: deepseekModel,
       DEEPSEEK_BASE_URL: deepseekBaseURL,
+      OLLAMA_PROTOCOL: existing.env.OLLAMA_PROTOCOL || "openai-chat",
+      OLLAMA_MODEL: existing.env.OLLAMA_MODEL || "qwen3.8:27b-mtp-q8_0",
+      OLLAMA_BASE_URL: existing.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434/v1",
       CCAGENT_COMPUTER_USE_INDICATOR: existing.env.CCAGENT_COMPUTER_USE_INDICATOR || "1",
     };
     if (configureQwen) {
@@ -549,7 +574,10 @@ export async function runInitCommand(
         DASHSCOPE_API_KEY: qwenApiKey,
         DASHSCOPE_BASE_URL: qwenBaseURL,
         QWEN_PROTOCOL: "openai-chat",
-        QWEN_MODEL: qwenModel,
+        QWEN_MODEL: getQwenOmniModel({ QWEN_MODEL: existing.env.QWEN_MODEL })
+          ? DEFAULT_QWEN_MODELS : existing.env.QWEN_MODEL || DEFAULT_QWEN_MODELS,
+        QWEN_OMNI_MODEL: qwenOmniModel,
+        QWEN_PLUS_MODEL: existing.env.QWEN_PLUS_MODEL || "qwen-plus",
         QWEN_TTS_MODEL: existing.env.QWEN_TTS_MODEL || DEFAULT_QWEN_TTS_MODEL,
         QWEN_TTS_VOICE: existing.env.QWEN_TTS_VOICE || DEFAULT_QWEN_TTS_VOICE,
       });
@@ -599,7 +627,7 @@ export async function runInitCommand(
         ? { deepseek: { apiKey: deepseekApiKey, baseURL: deepseekBaseURL, model: deepseekModel } }
         : {}),
       ...(configureQwen && qwenApiKey
-        ? { qwen: { apiKey: qwenApiKey, baseURL: qwenBaseURL, model: qwenModel } }
+        ? { qwen: { apiKey: qwenApiKey, baseURL: qwenBaseURL, model: qwenOmniModel } }
         : {}),
       ...(configureJev && openRouterApiKey
         ? { jev: { apiKey: openRouterApiKey, model: jevModel } }

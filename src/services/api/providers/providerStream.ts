@@ -29,6 +29,7 @@ import {
 import { APIError } from "@anthropic-ai/sdk";
 
 import { DEFAULT_MAX_TOKENS } from "../client.js";
+import { stabilizeToolDefinitions } from "../toolDefinitions.js";
 import type { StreamRequestParams, StreamResult } from "../streaming.js";
 import type { ModelProfile } from "./profile.js";
 import type {
@@ -40,6 +41,7 @@ import type {
   Usage,
 } from "../../../types/message.js";
 import { writeStreamDebug } from "../../../utils/streamDebug.js";
+import { getPlatformGatewayClient } from "../../../platform/gatewayClient.js";
 import {
   buildDefaultThinkingConfig,
   getSessionEffortLevel,
@@ -57,6 +59,7 @@ import {
   universalToOpenAIResponsesInput,
 } from "./openaiTranslate.js";
 import { assembleOpenAIResponses } from "./openaiResponsesNative.js";
+import { isDeepSeekProfile, deepseekReasoningEndpoint, applyDeepSeekHistory, parseDeepSeekChatStream } from "./deepseekChat.js";
 
 // ─── Protocol → llm-bridge provider + endpoint defaults ────────────────────
 
@@ -159,6 +162,7 @@ function applyOpenAIToolChoice(
 
 /** Translate Anthropic-shaped params into a ready-to-fetch provider request. */
 export function prepareRequest(profile: ModelProfile, params: StreamRequestParams): PreparedRequest {
+  if (params.inputAudio && profile.protocol !== "openai-chat") throw new Error("Omni audio input requires the openai-chat protocol.");
   if (profile.protocol === "anthropic") {
     // Defensive: callers route anthropic elsewhere. Keep the type total.
     throw new Error("prepareRequest called with anthropic profile");
@@ -167,10 +171,10 @@ export function prepareRequest(profile: ModelProfile, params: StreamRequestParam
 
   const anthropicBody = {
     model: profile.model,
-    max_tokens: profile.maxTokens ?? params.maxTokens ?? DEFAULT_MAX_TOKENS,
+    max_tokens: profile.platformService ? Math.min(profile.maxTokens ?? DEFAULT_MAX_TOKENS, params.maxTokens ?? profile.maxTokens ?? DEFAULT_MAX_TOKENS) : profile.maxTokens ?? params.maxTokens ?? DEFAULT_MAX_TOKENS,
     messages: params.messages,
     ...(params.system ? { system: params.system } : {}),
-    ...(params.tools && params.tools.length > 0 ? { tools: params.tools } : {}),
+    ...(params.tools && params.tools.length > 0 ? { tools: stabilizeToolDefinitions(params.tools) } : {}),
     ...(params.toolChoice ? { tool_choice: params.toolChoice } : {}),
   } as unknown as AnthropicBody;
 
@@ -248,10 +252,47 @@ export function prepareRequest(profile: ModelProfile, params: StreamRequestParam
   } else {
     // openai-chat: rebuild `messages[]` so tool results become `role:"tool"`
     // messages carrying tool_call_id (llm-bridge mis-emits these).
-    body.messages = universalToOpenAIChatMessages(universal);
-    // Ask for a final usage chunk so token accounting matches the Anthropic path.
+    const qwenText = /^qwen3\.8-(?:max|flash)(?:$|-)/i.test(profile.officialUpstreamModel ?? profile.model);
+    body.messages = universalToOpenAIChatMessages(universal, qwenText);
+    if (isDeepSeekProfile(profile)) applyDeepSeekHistory(body.messages as Record<string, unknown>[], params.messages, profile);
     body.stream_options = { include_usage: true };
-    if (reasoningEffort) body.reasoning_effort = reasoningEffort;
+    if (isDeepSeekProfile(profile)) {
+      const thinking = params.thinking ?? buildDefaultThinkingConfig();
+      const enabled = thinking.type !== "disabled" && !process.env.CLAUDE_CODE_DISABLE_THINKING;
+      body.thinking = { type: enabled ? "enabled" : "disabled" };
+      const effort = params.effortLevel ?? getSessionEffortLevel();
+      if (enabled && effort) body.reasoning_effort = effort === "medium" ? "high" : effort;
+    } else if (qwenText) {
+      const thinkingOn = isThinkingActive(params) && !process.env.CLAUDE_CODE_DISABLE_THINKING;
+      body.enable_thinking = thinkingOn;
+      body.preserve_thinking = thinkingOn;
+      if (!thinkingOn) body.reasoning_effort = "none";
+      else if (reasoningEffort) body.reasoning_effort = reasoningEffort === "high" ? "xhigh" : reasoningEffort;
+    } else if (/^qwen3\.8-omni-flash(?:-|$)/i.test(profile.officialUpstreamModel ?? profile.model)) {
+      // Qwen 3.8 Omni maps "minimal" to low reasoning; only "none" switches
+      // reasoning off. Honor explicit vision requests even when a session has
+      // a higher effort selected. Keep the gateway route id in body.model.
+      const disabled = (params.thinking ?? buildDefaultThinkingConfig()).type === "disabled" || process.env.CLAUDE_CODE_DISABLE_THINKING;
+      if (disabled) body.reasoning_effort = "none";
+      else if (reasoningEffort) body.reasoning_effort = reasoningEffort;
+    } else if (profile.provider === "ollama") {
+      // Ollama's `minimal` alias enables thinking, which rejects ordinary
+      // models such as Qwen2.5. Use its documented off value; otherwise let
+      // the model choose its own default rather than force OpenAI levels.
+      if ((params.thinking ?? buildDefaultThinkingConfig()).type === "disabled" || process.env.CLAUDE_CODE_DISABLE_THINKING) body.reasoning_effort = "none";
+    } else if (reasoningEffort) body.reasoning_effort = reasoningEffort;
+  }
+  if (params.inputAudio) {
+    if (params.messages.length !== 1 || params.messages[0]?.role !== "user" || typeof params.messages[0].content !== "string" || params.tools?.length) {
+      throw new Error("Omni audio reading requires one text prompt without tools.");
+    }
+    body.messages = [{ role: "user", content: [
+      { type: "input_audio", input_audio: params.inputAudio },
+      { type: "text", text: params.messages[0].content },
+    ] }];
+    body.modalities = ["text"];
+    body.enable_thinking = false;
+    delete body.reasoning_effort;
   }
   return {
     provider,
@@ -315,7 +356,9 @@ export async function* streamViaProvider(
     thinkingConfig: (prepared.body.generationConfig as Record<string, unknown> | undefined)?.thinkingConfig,
   });
 
-  let response = await fetch(prepared.url, {
+  let response = profile.platformService ? await (await getPlatformGatewayClient()).call(profile.protocol === "openai-responses" ? "responses" : "chat/completions", prepared.body, {
+    requestId: params.platformRequestId, signal: params.signal,
+  }) : await fetch(prepared.url, {
     method: "POST",
     headers: prepared.headers,
     body: JSON.stringify(prepared.body),
@@ -418,7 +461,12 @@ export async function* streamViaProvider(
     return yield* assembleOpenAIResponses(response.body);
   }
 
-  const parse = parserFor(prepared.provider);
+  const deepseek = isDeepSeekProfile(profile);
+  // The official stream reaches EOF after its result and usage are persisted.
+  // Draining it keeps the native call journal from treating completion as cancel.
+  const parse = deepseek
+    ? (body: ReadableStream<Uint8Array>) => parseDeepSeekChatStream(body, { waitForEOF: !!profile.platformService })
+    : parserFor(prepared.provider);
 
   // Accumulators — mirror streaming.ts so the assembled message is identical.
   const contentBlocks: ContentBlock[] = [];
@@ -441,6 +489,7 @@ export async function* streamViaProvider(
       case "content_delta": {
         if (event.delta.text) {
           if (!currentText) {
+            if (deepseek && currentThinking) yield { type: "thinking_done", thinking: currentThinking.thinking, signature: currentThinking.signature };
             currentText = { type: "text", text: "" };
             contentBlocks.push(currentText);
             currentThinking = null;
@@ -450,7 +499,7 @@ export async function* streamViaProvider(
         }
         if (event.delta.thinking) {
           if (!currentThinking) {
-            currentThinking = { type: "thinking", thinking: "" };
+            currentThinking = { type: "thinking", thinking: "", ...(deepseek ? { reasoningProvider: "deepseek" as const, reasoningEndpoint: deepseekReasoningEndpoint(profile) } : {}) };
             contentBlocks.push(currentThinking);
             currentText = null;
             yield { type: "thinking_start" };

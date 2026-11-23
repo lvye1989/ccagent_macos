@@ -77,10 +77,12 @@ export function QuestionPrompt({
   const optionCount = question.options.length;
   const inputRow = optionCount;
   const chatRow = optionCount + 1;
+  const cancelLabel = question.cancelLabel ?? "Chat about this instead";
+  const escapeHint = question.cancelLabel ? `Esc: ${cancelLabel}` : "Esc to cancel";
 
   const hint = multi
-    ? "Space to toggle · Enter to confirm · ↑/↓ to navigate · Esc to cancel"
-    : "Enter to select · ↑/↓ to navigate · Esc to cancel";
+    ? `Space to toggle · Enter to confirm · ↑/↓ to navigate · ${escapeHint}`
+    : `Enter to select · ↑/↓ to navigate · ${escapeHint}`;
 
   return (
     <Box
@@ -150,7 +152,7 @@ export function QuestionPrompt({
         {/* Bail-out row — cancel the dialog and reply to the model normally. */}
         <Row highlighted={highlight === chatRow}>
           <Text color={highlight === chatRow ? theme.brandLight : undefined}>
-            {`${chatRow + 1}. Chat about this instead`}
+            {`${chatRow + 1}. ${cancelLabel}`}
           </Text>
         </Row>
       </Box>

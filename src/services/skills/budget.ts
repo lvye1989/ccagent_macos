@@ -9,8 +9,7 @@
  *   - Three-tier degradation: full → truncated descriptions → names-only
  *
  * Where ours differs from the source:
- *   - No "bundled skill never truncates" privilege (we have no bundled
- *     skills in stage 17 — see DEVELOPMENT-PLAN §17.6.1).
+ *   - Bundled and user skills share the same description budget.
  *   - The budget is in CHARACTERS, not tokens. The source's
  *     `contextWindowTokens × 4 × 1%` heuristic assumes ~4 chars/token, so
  *     our default 8000 chars ≈ 2000 tokens for a 200K-token model.
@@ -107,6 +106,9 @@ export function formatSkillsSystemReminder(skills: Skill[]): string {
     "<system-reminder>",
     "Available skills you can invoke via the `Skill` tool. Each line is `- <name>: <description>`.",
     "Call `Skill(skill=\"<name>\", args=\"<optional args>\")` when the user's request matches one of these.",
+    ...(skills.some((skill) => skill.name === "skill-creator") ? [
+      "When the user asks to create or update a reusable skill, invoke skill-creator before writing its instructions or resources.",
+    ] : []),
     "",
     listing,
     "</system-reminder>",

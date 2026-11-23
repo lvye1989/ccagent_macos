@@ -25,6 +25,7 @@ import {
   splitFrontmatter,
 } from "./parseFrontmatter.js";
 import type { Skill, SkillSource } from "../../types/types.js";
+import { canonicalSkillName } from "./names.js";
 
 const SKILL_FILE = "SKILL.md";
 
@@ -160,8 +161,12 @@ export async function loadAllSkills(cwd: string): Promise<LoadAllSkillsResult> {
   for (const skill of [...userResult.skills, ...projectResult.skills]) {
     if (seenRealPaths.has(skill.filePath)) continue; // symlink loop
     seenRealPaths.add(skill.filePath);
+    const name = canonicalSkillName(skill.name);
+    const previous = byName.get(name);
+    // Prefer a canonical definition over its alias within the same scope.
+    if (name !== skill.name && previous?.source === skill.source && previous.frontmatter.name !== skill.name) continue;
     // Project source loaded after user, so this assignment wins on collision.
-    byName.set(skill.name, skill);
+    byName.set(name, name === skill.name ? skill : { ...skill, name });
   }
 
   return {

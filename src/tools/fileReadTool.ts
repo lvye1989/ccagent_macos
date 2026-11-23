@@ -6,6 +6,8 @@ import * as fs from "node:fs/promises";
 import type { Tool, ToolContext, ToolResult } from "./Tool.js";
 import { ensureRealPathInsideAllowedRoots, resolveWorkspacePath } from "./pathUtils.js";
 import { isImagePath, readImageAsBlock } from "./imageUtils.js";
+import { isAudioPath, readAudioAsBlock } from "./audioUtils.js";
+import { isSkillEnabled } from "../utils/agentSkillsEnabled.js";
 
 interface FileReadInput {
   file_path: string;
@@ -78,6 +80,15 @@ export const fileReadTool: Tool = {
       if (stat.isDirectory()) {
         const entries = await fs.readdir(resolvedPath);
         return { content: `Directory listing for ${input.file_path}:\n${entries.join("\n")}` };
+      }
+
+      if (isAudioPath(resolvedPath)) {
+        if (!isSkillEnabled("read-audio")) return { content: "Audio reading skill is closed. Use /agent-skill open and /agent-skill open read-audio to enable it.", isError: true };
+        const audio = await readAudioAsBlock(resolvedPath, context.abortSignal);
+        return audio.ok ? { content: [
+          { type: "text", text: `Read audio ${input.file_path} (${audio.mediaType}, ${audio.bytes} bytes); read-audio will extract evidence via QWEN_OMNI_MODEL.` },
+          audio.block,
+        ] } : { content: `Error: ${audio.error}`, isError: true };
       }
 
       // Images come back as a real image block so the model can see them,

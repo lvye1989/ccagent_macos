@@ -1,6 +1,12 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 
+/** Use the login shell only when it actually is Bash. */
+export function resolvePosixBashExecutable(shell: string | undefined): string {
+  const candidate = shell?.trim();
+  return candidate && /(?:^|\/)bash$/.test(candidate) ? candidate : "bash";
+}
+
 /**
  * Resolve a Bash implementation that understands CCAGENT's native paths.
  * Windows' System32/bash.exe is a WSL launcher, so prefer Git Bash there.
@@ -10,14 +16,16 @@ export function resolveBashExecutable(): string {
   if (configured) return configured;
 
   if (process.platform !== "win32") {
-    return process.env.SHELL?.trim() || "bash";
+    return resolvePosixBashExecutable(process.env.SHELL);
   }
 
   const shell = process.env.SHELL?.trim();
   const shellLooksLikeWslLauncher = shell
     ? /(?:^|[/\\])Windows[/\\]System32[/\\]bash\.exe$/i.test(shell) || shell.toLowerCase() === "bash"
     : false;
-  if (shell && !shell.startsWith("/") && !shellLooksLikeWslLauncher) return shell;
+  // Windows launchers commonly inherit PowerShell/cmd as SHELL. Those do not
+  // understand Bash's -lc or POSIX commands; only accept an actual Bash name.
+  if (shell && !shell.startsWith("/") && !shellLooksLikeWslLauncher && /(?:^|[/\\])bash(?:\.exe)?$/i.test(shell)) return shell;
 
   const candidates = [
     path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe"),

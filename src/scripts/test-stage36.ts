@@ -195,6 +195,22 @@ try {
     "npm pack --dry-run succeeds",
   );
 
+  const editorFiles: string[] = [];
+  async function collectEditorFiles(relative = ""): Promise<void> {
+    const directory = path.join(PROJECT_ROOT, "dist", "whiteboard", relative);
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) throw new Error("The whiteboard release assets must not contain links.");
+      const file = path.posix.join(relative, entry.name);
+      if (entry.isDirectory()) await collectEditorFiles(file);
+      else if (entry.isFile()) editorFiles.push(file);
+      else throw new Error("The whiteboard release assets must be regular files.");
+    }
+  }
+  await collectEditorFiles();
+  const editorPattern = /^(?:whiteboard-editor\.(?:js|css)|[A-Za-z0-9][A-Za-z0-9._-]*-[A-Z0-9]{8}\.js|Assistant-(?:Bold|Medium|Regular|SemiBold)-[A-Z0-9]{8}\.woff2|fonts\/[A-Za-z0-9][A-Za-z0-9._/-]*\.woff2|licenses\/(?:Excalidraw|Excalidraw-fonts|React|ReactDOM)\.txt)$/;
+  assert(editorFiles.every(file => editorPattern.test(file)), "editor assets contain only generated scripts, styles, fonts and named licenses", editorFiles.filter(file => !editorPattern.test(file)).join(", "));
+  assert(["whiteboard-editor.js", "whiteboard-editor.css", "licenses/Excalidraw.txt", "licenses/Excalidraw-fonts.txt", "licenses/React.txt", "licenses/ReactDOM.txt"].every(file => editorFiles.includes(file))
+    && editorFiles.some(file => file.startsWith("fonts/") && file.endsWith(".woff2")), "editor entrypoints, fonts and license notices are packaged");
   const expectedFiles = [
     ".env.example",
     "LICENSE",
@@ -203,15 +219,72 @@ try {
     "dist/ccagent.js",
     "dist/ccagent.js.map",
     "macos/ccagent_computer_use.swift",
+    "dist/charts.js",
+    ...editorFiles.map(file => `dist/whiteboard/${file}`),
     "package.json",
     "rhino/TOOLKIT.md",
     "rhino/ccagent_grasshopper.py",
     "rhino/ccagent_rhino_architecture.py",
     "rhino/ccagent_rhino_runner.py",
     "rhino/ccagent_rhino_toolkit.py",
-  ];
+    "web/README.md",
+    "web/account-center.js",
+    "web/account-menu.js",
+    "web/app-catalog.js",
+    "web/app-icons.js",
+    "web/app.js",
+    "web/browser-panel.css",
+    "web/browser-panel.js",
+    "web/caiyunjian-logo.jpg",
+    "web/chatgpt-web.css",
+    "web/cloudtv-logo.jpg",
+    "web/cloudtv.css",
+    "web/cloudtv.js",
+    "web/codex-layout.css",
+    "web/composer-tools.js",
+    "web/customization.css",
+    "web/customization.js",
+    "web/data-visualization-NOTICES.txt",
+    "web/favicon.svg",
+    "web/index.html",
+    "web/library.js",
+    "web/login.css",
+    "web/login.html",
+    "web/login.js",
+    "web/memory.js",
+    "web/plugins.css",
+    "web/plugins.js",
+    "web/promotion.css",
+    "web/promotion.js",
+    "web/schedules.js",
+    "web/select-folder.ps1",
+    "web/styles.css",
+    "web/version-updates.js",
+    "web/visualization-model.js",
+    "web/visualization.css",
+    "web/visualization.js",
+    "web/voice.css",
+    "web/voice.js",
+    "web/whiteboard-ai.js",
+    "web/whiteboard-ai.css",
+    "web/whiteboard-design.js",
+    "web/whiteboard-design-canvas.js",
+    "web/whiteboard-design.css",
+    "web/whiteboard.js",
+    "web/whiteboard.css",
+    "web/whiteboard-editor.html",
+    "web/whiteboard-editor-shell.css",
+    "web/workbench.css",
+    "web/workspace-features.css",
+    "web/workspace-files.js",
+    "web/workspace-picker.css",
+    "web/workspace-picker.js",
+  ].sort();
   const packedFiles = dryRun?.[0]?.files.map((file) => file.path).sort() ?? [];
-  assert(JSON.stringify(packedFiles) === JSON.stringify(expectedFiles), "tarball contains only release files", packedFiles.join(", "));
+  assert(JSON.stringify(packedFiles) === JSON.stringify(expectedFiles), "tarball contains only release files", JSON.stringify({
+    unexpected: packedFiles.filter(file => !expectedFiles.includes(file)),
+    missing: expectedFiles.filter(file => !packedFiles.includes(file)),
+  }));
 
   const pack = parseNpmJson<PackResult[]>(
     runNpm(["pack", "--json", "--ignore-scripts", "--pack-destination", packDir], { env: npmEnv }),

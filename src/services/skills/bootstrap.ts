@@ -12,6 +12,8 @@
 
 import { loadAllSkills } from "./loadSkillsDir.js";
 import { setSkills } from "./registry.js";
+import { ensureBuiltinSkills } from "./builtins.js";
+import { bootstrapSkillStates } from "./preferences.js";
 
 export interface SkillsBootstrapResult {
   skillCount: number;
@@ -20,7 +22,10 @@ export interface SkillsBootstrapResult {
 }
 
 export async function bootstrapSkills(cwd: string): Promise<SkillsBootstrapResult> {
+  const installWarnings = await ensureBuiltinSkills();
+  await bootstrapSkillStates();
   const { skills, warnings } = await loadAllSkills(cwd);
+  warnings.unshift(...installWarnings);
   setSkills(skills);
 
   const conditionalCount = skills.filter(

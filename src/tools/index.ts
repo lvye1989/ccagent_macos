@@ -15,6 +15,9 @@ import { bashTool } from "./bashTool.js";
 import { fileEditTool } from "./fileEditTool.js";
 import { multiEditTool } from "./multiEditTool.js";
 import { fileReadTool } from "./fileReadTool.js";
+import { readImageTool } from "./readImageTool.js";
+import { generateImageTool } from "./generateImageTool.js";
+import { analyzeDataTool } from "./analyzeDataTool.js";
 import { fileWriteTool } from "./fileWriteTool.js";
 import { globTool } from "./globTool.js";
 import { grepTool } from "./grepTool.js";
@@ -58,10 +61,16 @@ import { agentTeamModeTool } from "./agentTeamModeTool.js";
 import { rhinoActionTool, rhinoObserveTool, rhinoInspectTool } from "./rhinoTools.js";
 import { rhinoSequenceTool } from "./rhinoSequence.js";
 import { mailTool } from "./mailTool.js";
+import { toolSearchTool } from "./toolSearchTool.js";
+import { knowledgeSearchTool } from "./knowledgeSearchTool.js";
 import type { PermissionMode } from "../permissions/permissions.js";
 
 const BUILTIN_TOOLS: Tool[] = [
+  toolSearchTool,
   fileReadTool,
+  readImageTool,
+  generateImageTool,
+  analyzeDataTool,
   fileWriteTool,
   fileEditTool,
   multiEditTool,
@@ -79,6 +88,7 @@ const BUILTIN_TOOLS: Tool[] = [
   rhinoActionTool,
   rhinoSequenceTool,
   mailTool,
+  knowledgeSearchTool,
   markdownToPdfTool,
   wordToPdfTool,
   pdfToWordTool,
@@ -195,10 +205,11 @@ export function getToolRegistryRevision(): number {
 }
 
 /**
- * Get tool API params with mode-aware Enter/Exit visibility.
+ * Get the full enabled pool with mode-aware Enter/Exit visibility.
  *
- * The model always sees all tools (Write, Edit, Bash, etc.) regardless
- * of mode. Enforcement happens in checkPermission at execution time.
+ * ToolDiscovery selects the subset advertised to the model. This function
+ * retains the full pool for discovery, diagnostics, and scoped child agents.
+ * Enforcement happens in checkPermission at execution time.
  * Only the plan mode transition tools are toggled:
  * - In plan mode: hide EnterPlanMode, show ExitPlanMode
  * - Outside plan mode: show EnterPlanMode, hide ExitPlanMode

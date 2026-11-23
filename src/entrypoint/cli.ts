@@ -3,8 +3,6 @@
 // other module body runs. See preflight.ts for why the ordering matters.
 import "./preflight.js";
 import { loadEnv } from "../utils/loadEnv.js";
-await loadEnv();
-import { buildSystemPrompt, renderSystemPrompt } from "../context/systemPrompt.js";
 import type { PermissionMode } from "../permissions/permissions.js";
 import { VERSION } from "../version.js";
 
@@ -27,9 +25,24 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  if (process.argv[2] === "init") {
-    const { runInitCommand } = await import("./init.js");
-    process.exitCode = await runInitCommand(process.argv.slice(3));
+  if (process.argv[2] === "account") {
+    const { runAccountCommand } = await import("./account.js");
+    process.exitCode = await runAccountCommand(process.argv.slice(3));
+    return;
+  }
+
+  if (process.argv[2] === "web") {
+    const { runWebServer } = await import("./web.js");
+    await runWebServer(process.argv.slice(3));
+    return;
+  }
+
+  if (process.argv[2] === "web-worker") {
+    if (!process.send || !/^[a-f0-9]{64}$/.test(process.env.CCAGENT_WEB_WORKER_TOKEN ?? "")) throw new Error("This is a private account worker.");
+    const { requirePlatformScope } = await import("../platform/account.js");
+    await requirePlatformScope(0);
+    const { runWebWorker } = await import("./webWorker.js");
+    await runWebWorker(process.argv.slice(3));
     return;
   }
 
@@ -40,6 +53,8 @@ CCAGENT v${VERSION} — Terminal-native agentic coding system
 Usage:
   ccagent [options]            (long alias: ccagent)
   ccagent init [--skip-test]   Create user settings, store keys, test models
+  ccagent account             Email login, registration and account settings
+  ccagent web [--port 4173]   Start the local web interface
 
 Options:
   -v, --version               Print version and exit
@@ -95,7 +110,10 @@ Commands (in REPL):
   /history                    Show session history
   /workfriend                 Start the built-in work companion and daily check-in
   /agent-team [open|close]    Open or close Agent Teams (interactive if omitted)
-  /agent-skill [open|close]   Open or close Skills (interactive if omitted)
+  /agent-skill [list|open|close|delete|status]
+                            Manage installed skills (interactive if omitted)
+  /model [name|list|default|save [name]]
+                            Select a model or save a persistent user default
 
 Extensions (Markdown + frontmatter):
   Output styles: ~/.ccagent/output-styles/<name>.md (default/Explanatory/Learning built-in)
@@ -157,6 +175,19 @@ Settings keys (in ~/.ccagent/settings.json or <cwd>/.ccagent/settings.json):
     process.exit(0);
   }
 
+  // Bind the process before importing engine modules or reading personal settings.
+  // API keys, custom providers and noninteractive flags cannot replace login.
+  const { enterPlatformAccount } = await import("../platform/account.js");
+  await enterPlatformAccount();
+  await loadEnv();
+
+  if (process.argv[2] === "init") {
+    const { runInitCommand } = await import("./init.js");
+    process.exitCode = await runInitCommand(process.argv.slice(3));
+    return;
+  }
+
+  const { buildSystemPrompt, renderSystemPrompt } = await import("../context/systemPrompt.js");
   const modelIndex = process.argv.indexOf("--model");
   const model = modelIndex !== -1 ? process.argv[modelIndex + 1] : undefined;
   const dumpSystemPrompt = process.argv.includes("--dump-system-prompt");
@@ -323,7 +354,7 @@ Settings keys (in ~/.ccagent/settings.json or <cwd>/.ccagent/settings.json):
 
   if (dumpSystemPrompt) {
     const cwd = process.cwd();
-    const systemParts = await buildSystemPrompt({ cwd });
+    const systemParts = await buildSystemPrompt({ cwd, applicationProtection: true });
     const system = renderSystemPrompt(systemParts);
     console.log(system);
     process.exit(0);
@@ -409,17 +440,28 @@ Settings keys (in ~/.ccagent/settings.json or <cwd>/.ccagent/settings.json):
   // never reach the interactive REPL below.
   if (isPrintMode) {
     const { runHeadless } = await import("./headless.js");
-    await runHeadless({
-      promptArg: printPrompt,
-      permissionMode,
-      bypassPermissions,
-      outputFormat:
-        outputFormat === "json"
-          ? "json"
-          : outputFormat === "stream-json"
-            ? "stream-json"
-            : "text",
-    });
+    const { bootstrapMcp } = await import("../services/mcp/bootstrap.js");
+    const { getMcpRegistry } = await import("../services/mcp/registry.js");
+    const { clearServerCache } = await import("../services/mcp/client.js");
+    // A one-turn consumer must await discovery, unlike the interactive UI.
+    // Otherwise configured MCP tools never reach the headless model request.
+    try {
+      await bootstrapMcp(process.cwd()).catch((error) => console.error(`[ccagent] MCP bootstrap failed: ${String(error)}`));
+      await refreshActivePlugins(process.cwd(), { pluginDirs }).catch((error) => console.error(`[ccagent] plugin MCP bootstrap failed: ${String(error)}`));
+      await runHeadless({
+        promptArg: printPrompt,
+        permissionMode,
+        bypassPermissions,
+        outputFormat:
+          outputFormat === "json"
+            ? "json"
+            : outputFormat === "stream-json"
+              ? "stream-json"
+              : "text",
+      });
+    } finally {
+      await Promise.allSettled(getMcpRegistry().map(({ connection }) => clearServerCache(connection.name, connection.config)));
+    }
     return;
   }
 

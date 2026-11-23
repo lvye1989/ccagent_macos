@@ -57,6 +57,7 @@ export async function* handleStatusCommand(
     `- Messages in context: ${ctx.getMessages().length}`,
     `- Session tokens: in ${ctx.getTotalUsage().input_tokens} / out ${ctx.getTotalUsage().output_tokens}`,
     `- Tools enabled (${tools.length}): ${toolNames.join(", ")}`,
+    ...(ctx.getModelTools ? [`- Tool definitions loaded for model: ${ctx.getModelTools().length}/${getToolsApiParams(ctx.getPermissionMode()).length} (on demand)`] : []),
     mcp.length === 0
       ? "- MCP servers: none configured"
       : `- MCP servers: ${connectedMcp.length}/${mcp.length} connected`,
@@ -78,9 +79,11 @@ export async function* handleContextCommand(
   const model = ctx.getActiveModel();
   const messages = ctx.getMessages();
 
-  const systemParts = await buildSystemPrompt({ cwd });
+  const systemParts = await buildSystemPrompt({ cwd, runtimeStateInMessages: true });
   const systemPrompt = renderSystemPrompt(systemParts);
-  const toolsJson = JSON.stringify(getToolsApiParams(ctx.getPermissionMode()));
+  const availableTools = getToolsApiParams(ctx.getPermissionMode());
+  const loadedTools = ctx.getModelTools?.() ?? availableTools;
+  const toolsJson = JSON.stringify(loadedTools);
   const [agentMd, memoryEntry] = await Promise.all([
     loadAgentMdContext(cwd).catch(() => null),
     readMemoryEntrypoint(cwd).catch(() => null),
@@ -123,6 +126,7 @@ export async function* handleContextCommand(
     `Context usage (${model})`,
     "",
     `Context window: ${fmt(contextWindow)} tokens`,
+    `Tool definitions loaded: ${loadedTools.length}/${availableTools.length} (on demand)`,
     "",
     row("System prompt", systemCoreTokens),
     row("AGENT.md + memory", memoryTokens),

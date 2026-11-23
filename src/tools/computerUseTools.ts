@@ -1,17 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages.js";
-import type { ContentBlock, ImageBlock } from "../types/message.js";
-import { createMessage } from "../services/api/streaming.js";
+import type { ImageBlock } from "../types/message.js";
 import {
-  collectViaProvider,
-} from "../services/api/providers/providerStream.js";
-import {
-  loadProfiles,
-  loadModelRoles,
   resolveProfile,
   type ModelProfile,
-  type ModelProtocol,
 } from "../services/api/providers/profile.js";
+import { analyzeImageBlock, resolveVisionProfile } from "../services/vision/analyzeImage.js";
+import { modelSupportsImages } from "../services/vision/capabilities.js";
 import type { Tool, ToolContext, ToolResult } from "./Tool.js";
 import { COMPUTER_USE_BROWSER_FAST_PATH_GUIDANCE } from "./computerUseGuidance.js";
 import { MAX_IMAGE_BYTES } from "./imageUtils.js";
@@ -45,6 +40,7 @@ interface StoredSnapshot {
   observation: ComputerObservation;
   createdAt: number;
   perception?: string;
+  perceptionModel?: string;
 }
 
 interface ObserveInput {
@@ -305,37 +301,6 @@ function imageBlock(observation: ComputerObservation): ImageBlock {
   };
 }
 
-function envPerceptionProfile(): ModelProfile | null {
-  const model = process.env.QWEN_MODEL?.trim();
-  const rawProtocol = process.env.QWEN_PROTOCOL?.trim() || "openai-chat";
-  if (!model) return null;
-  if (!["openai-chat", "openai-responses", "gemini"].includes(rawProtocol)) return null;
-  const baseURL = process.env.QWEN_BASE_URL?.trim() || process.env.DASHSCOPE_BASE_URL?.trim();
-  const apiKey = process.env.QWEN_API_KEY?.trim() || process.env.DASHSCOPE_API_KEY?.trim();
-  return {
-    id: "qwen-computer-perception",
-    protocol: rawProtocol as ModelProtocol,
-    model,
-    ...(baseURL ? { baseURL } : {}),
-    ...(apiKey ? { apiKey } : {}),
-  };
-}
-
-async function resolvePerceptionProfile(cwd: string): Promise<ModelProfile | null> {
-  const fromEnv = envPerceptionProfile();
-  if (fromEnv) return fromEnv;
-  const roles = await loadModelRoles(cwd);
-  const handle =
-    roles.computerUse ||
-    roles.computer_use ||
-    roles.vision ||
-    roles.image ||
-    roles.multimodal;
-  if (!handle) return null;
-  const { profiles } = await loadProfiles(cwd);
-  return profiles[handle] ?? null;
-}
-
 async function perceiveScreenshot(
   observation: ComputerObservation,
   profile: ModelProfile,
@@ -351,32 +316,10 @@ async function perceiveScreenshot(
     "Accessibility hints:",
     accessibility || "No accessibility elements were available.",
   ].join("\n");
-  const messages = [
-    {
-      role: "user",
-      content: [{ type: "text", text: prompt }, imageBlock(observation)],
-    },
-  ] as unknown as MessageParam[];
-  const params = {
-    messages,
-    model: profile.id,
-    maxTokens: 1_500,
-    signal,
-    querySource: "background" as const,
-    thinking: { type: "disabled" as const },
-  };
-  const result =
-    profile.protocol === "anthropic"
-      ? await createMessage(params)
-      : await collectViaProvider(profile, params);
-  return result.content
-    .filter((block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
+  return (await analyzeImageBlock(imageBlock(observation), prompt, profile, signal, 1_500)).text;
 }
 
-async function buildObservationResult(
+export async function buildObservationResult(
   snapshot: StoredSnapshot,
   input: Pick<ObserveInput, "image_delivery" | "perception">,
   context: ToolContext,
@@ -385,17 +328,25 @@ async function buildObservationResult(
   const observation = snapshot.observation;
   let text = formatObservationText(snapshot.id, observation, options.maxElements);
   const perceptionMode = input.perception ?? "auto";
-  let perception = snapshot.perception || "";
+  const delivery = input.image_delivery ?? "auto";
+  // Fast local-only action feedback must never probe a remote provider.
+  const needsImages = perceptionMode !== "off" || delivery !== "text_only";
+  const active = needsImages && context.defaultModel ? await resolveProfile(context.defaultModel, context.cwd) : null;
+  const activeSeesImages = active ? await modelSupportsImages(active, context.abortSignal) : false;
+  const reusePerception = !activeSeesImages || (perceptionMode === "on" && snapshot.perceptionModel === active?.id);
+  let perception = reusePerception ? snapshot.perception || "" : "";
   let perceptionError = "";
   if (perception) {
     text += "\n\nPerception model (cached for this snapshot):\n" + perception;
-  } else if (perceptionMode !== "off") {
+  } else if (perceptionMode !== "off" && (!activeSeesImages || perceptionMode === "on")) {
     try {
-      const profile = await resolvePerceptionProfile(context.cwd);
+      const profile = await resolveVisionProfile(context.cwd, active ?? undefined,
+        ["computerUse", "computer_use", "vision", "image", "multimodal"], context.abortSignal);
       if (profile) {
         perception = await perceiveScreenshot(observation, profile, context.abortSignal);
         if (perception) {
           snapshot.perception = perception;
+          snapshot.perceptionModel = profile.id;
           text += "\n\nPerception model (" + profile.id + "):\n" + perception;
         }
       } else if (perceptionMode === "on") {
@@ -407,17 +358,11 @@ async function buildObservationResult(
   }
   if (perceptionError) text += "\n\nPerception fallback: " + perceptionError;
 
-  const delivery = input.image_delivery ?? "auto";
   let includeImage = delivery === "inline";
   if (delivery === "auto" && !perception) {
-    try {
-      const active = await resolveProfile(context.defaultModel || "", context.cwd);
-      includeImage = !/deepseek/i.test(active.model);
-      if (!includeImage) {
-        text += "\nScreenshot was kept out of the DeepSeek turn because no working perception model was available; use the accessibility tree or configure QWEN_MODEL/QWEN_PROTOCOL/DASHSCOPE_* (or modelRoles.image).";
-      }
-    } catch {
-      includeImage = true;
+    includeImage = activeSeesImages;
+    if (!includeImage) {
+      text += "\nScreenshot was kept out of the text-only model turn because no working perception model was available; use the accessibility tree or configure QWEN_OMNI_MODEL/QWEN_PROTOCOL/DASHSCOPE_* (or modelRoles.image).";
     }
   }
   if (delivery === "text_only") includeImage = false;
